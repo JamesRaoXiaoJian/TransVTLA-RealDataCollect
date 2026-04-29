@@ -1,0 +1,51 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Generated data and recordings
+pose_logs/
+pressure_logs/
+sessions/
+session419/
+sessions414/
+sample_output/
+
+# Common output files
+*.csv
+*.json
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.mp4
+*.avi
+*.mov
