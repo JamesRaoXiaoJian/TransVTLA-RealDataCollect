@@ -482,6 +482,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dji-index", type=int, default=DEFAULT_DJI_INDEX, help="OpenCV index for DJI camera.")
     parser.add_argument("--width", type=int, default=1280, help="Frame width for both streams.")
     parser.add_argument("--height", type=int, default=720, help="Frame height for both streams.")
+    parser.add_argument("--rs-fps", type=int, default=30, help="RealSense camera FPS (supports 30/60/90).")
     parser.add_argument("--output", type=Path, default=Path("sessions"), help="Base directory for recordings.")
     parser.add_argument(
         "--session-prefix",
@@ -668,7 +669,7 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
 
     dji = DJICamera(index=args.dji_index, width=args.width, height=args.height)
-    rs_camera = RealSenseRGB(width=args.width, height=args.height, fps=VISUAL_FPS)
+    rs_camera = RealSenseRGB(width=args.width, height=args.height, fps=args.rs_fps)
     robot = RobotArmCollector(host=args.arm_host, port=args.arm_port)
     pressure = PressureCollector(
         local_port=args.pressure_local_port,
