@@ -7,6 +7,7 @@ frames using an OpenCV trackbar or arrow keys.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 from typing import List, Optional
@@ -46,11 +47,114 @@ def load_robot_state(state_dir: Path, stem: str) -> str:
 	return f"{joint_txt}\n{pose_txt}"
 
 
+def draw_pressure_dashboard(canvas: np.ndarray, x: int, y: int, frame_w: int, values: list[int]) -> None:
+	if not values or len(values) < 64:
+		return
+
+	LEFT_CHANNEL = 19
+	RIGHT_CHANNEL = 18
+	LEFT_MATRIX_CHANNELS = [[1, 16, 15], [14, 13, 12], [11, 10, 9]]
+	RIGHT_MATRIX_CHANNELS = [[17, 32, 31], [30, 29, 28], [27, 26, 25]]
+
+	def get_val(ch: int) -> int:
+		return values[ch - 1] if 0 <= ch - 1 < len(values) else 0
+
+	left_val = get_val(LEFT_CHANNEL)
+	right_val = get_val(RIGHT_CHANNEL)
+	left_mat = [[get_val(ch) for ch in row] for row in LEFT_MATRIX_CHANNELS]
+	right_mat = [[get_val(ch) for ch in row] for row in RIGHT_MATRIX_CHANNELS]
+
+	all_vals = [abs(left_val), abs(right_val)] + [abs(v) for row in left_mat for v in row] + [abs(v) for row in right_mat for v in row]
+	peak = float(max(1, max(all_vals)))
+
+	def get_color(val: int) -> tuple[int, int, int]:
+		ratio = min(1.0, abs(val) / peak)
+		b = int(40 + (255 - 40) * ratio)
+		g = int(40 + (100 - 40) * ratio)
+		r = int(40 + (50 - 40) * ratio)
+		return (b, g, r)
+
+	def draw_text_centered(img, text, cx, cy, font_scale=0.6, color=(255, 255, 255)):
+		font = cv2.FONT_HERSHEY_SIMPLEX
+		th = 2 if font_scale > 0.5 else 1
+		sz, _ = cv2.getTextSize(text, font, font_scale, th)
+		cv2.putText(img, text, (int(cx - sz[0] / 2), int(cy + sz[1] / 2)), font, font_scale, color, th, cv2.LINE_AA)
+
+	col_w = frame_w // 3
+
+	# ==========================
+	# Column 1: Stacked L/R Bars
+	# ==========================
+	def draw_bar(bx: int, by: int, max_w: int, label: str, value: int) -> None:
+		bar_h = 40
+		font = cv2.FONT_HERSHEY_SIMPLEX
+		font_scale = 0.9
+		th = 2
+		label_size, _ = cv2.getTextSize(label, font, font_scale, th)
+		label_w = label_size[0]
+		label_h = label_size[1]
+		
+		baseline_y = by + (bar_h + label_h) // 2 - 2
+		cv2.putText(canvas, label, (bx + 10, baseline_y), font, font_scale, (240, 240, 240), th, cv2.LINE_AA)
+
+		b_left = bx + 10 + label_w + 15
+		b_right = bx + max_w - 20
+		b_w = max(20, b_right - b_left)
+
+		ratio = min(1.0, abs(value) / peak)
+		fill_w = int(b_w * ratio)
+		if fill_w > 0:
+			cv2.rectangle(canvas, (b_left, by), (b_left + fill_w, by + bar_h), get_color(value), -1)
+		cv2.rectangle(canvas, (b_left, by), (b_right, by + bar_h), (100, 100, 100), 2)
+		draw_text_centered(canvas, f"{value:d}", b_left + b_w // 2, by + bar_h // 2, font_scale=0.7)
+
+	bar_start_y = y + 60
+	draw_bar(x, bar_start_y, col_w, "Left", left_val)
+	draw_bar(x, bar_start_y + 80, col_w, "Right", right_val)
+
+	# ==========================
+	# Column 2 & 3: Matrices
+	# ==========================
+	def draw_matrix(mx: int, label: str, matrix: list[list[int]]) -> None:
+		font = cv2.FONT_HERSHEY_SIMPLEX
+		font_scale = 0.8
+		th = 2
+		label_size, _ = cv2.getTextSize(label, font, font_scale, th)
+		label_w = label_size[0]
+		label_h = label_size[1]
+		
+		matrix_area_w = col_w - 30 - label_w
+		cell_gap = 8
+		cell_s = min(86, (matrix_area_w - cell_gap * 2) // 3)
+		matrix_side = cell_s * 3 + cell_gap * 2
+		
+		matrix_y = y + 20
+		label_y = matrix_y + matrix_side // 2 + label_h // 2
+		
+		cv2.putText(canvas, label, (mx + 10, label_y), font, font_scale, (240, 240, 240), th, cv2.LINE_AA)
+		
+		matrix_x = mx + 20 + label_w
+
+		for row_i in range(3):
+			for col_i in range(3):
+				cx = matrix_x + col_i * cell_s
+				cy = matrix_y + row_i * cell_s
+				val = matrix[row_i][col_i]
+				inner = cell_s - cell_gap
+				cv2.rectangle(canvas, (cx, cy), (cx + inner, cy + inner), get_color(val), -1)
+				cv2.rectangle(canvas, (cx, cy), (cx + inner, cy + inner), (100, 100, 100), 1)
+				draw_text_centered(canvas, str(val), cx + inner // 2, cy + inner // 2, font_scale=0.55)
+
+	draw_matrix(x + col_w, "Left Matrix", left_mat)
+	draw_matrix(x + col_w * 2, "Right Matrix", right_mat)
+
+
 def compose_canvas(
 	dji_img: np.ndarray,
 	rs_img: np.ndarray,
 	frame_label: str,
 	state_lines: str,
+	pressure_values: list[int],
 	max_width: int = 3840,
 ) -> np.ndarray:
 	height = max(dji_img.shape[0], rs_img.shape[0])
@@ -71,11 +175,13 @@ def compose_canvas(
 	top[:, : left.shape[1]] = left
 	top[:, left.shape[1] + gap :] = right
 
-	info_height = 140
+	info_height = 420
 	info = np.zeros((info_height, width, 3), dtype=np.uint8)
 	cv2.putText(info, frame_label, (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 255), 3, cv2.LINE_AA)
 	for i, line in enumerate(state_lines.splitlines(), start=1):
 		cv2.putText(info, line, (20, 45 + i * 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (220, 220, 220), 2, cv2.LINE_AA)
+
+	draw_pressure_dashboard(info, 20, 140, width - 40, pressure_values)
 
 	canvas = np.vstack((top, info))
 	if canvas.shape[1] > max_width:
@@ -91,11 +197,25 @@ class SessionViewer:
 		self.dji_dir = session_path / "dji"
 		self.rs_dir = session_path / "realsense_rgb"
 		self.state_dir = session_path / "robot_state"
+		self.pressure_dir = session_path / "pressure"
 		if not self.dji_dir.exists() or not self.rs_dir.exists():
 			raise FileNotFoundError("Session missing dji or realsense_rgb directory.")
 		self.stems = common_frame_stems(self.dji_dir, self.rs_dir)
 		if not self.stems:
 			raise FileNotFoundError("No overlapping frame names between DJI and RealSense.")
+
+		self.pressure_data = []
+		pressure_csv = self.pressure_dir / "pressure.csv"
+		if pressure_csv.exists():
+			with open(pressure_csv, "r", encoding="utf-8") as f:
+				reader = csv.reader(f)
+				header = next(reader, None)
+				for row in reader:
+					try:
+						self.pressure_data.append([int(x) for x in row[1:65]])
+					except (ValueError, IndexError):
+						pass
+
 		self.index = 0
 		self.window = "Session Viewer"
 		cv2.namedWindow(self.window, cv2.WINDOW_NORMAL)
@@ -120,7 +240,14 @@ class SessionViewer:
 			cv2.imshow(self.window, blank)
 			return
 		state_lines = load_robot_state(self.state_dir, stem)
-		canvas = compose_canvas(dji_img, rs_img, f"Frame {stem}", state_lines)
+		
+		pressure_values = []
+		if self.pressure_data:
+			idx = int(self.index * len(self.pressure_data) / max(1, len(self.stems)))
+			idx = min(idx, len(self.pressure_data) - 1)
+			pressure_values = self.pressure_data[idx]
+
+		canvas = compose_canvas(dji_img, rs_img, f"Frame {stem}", state_lines, pressure_values)
 		cv2.imshow(self.window, canvas)
 
 
