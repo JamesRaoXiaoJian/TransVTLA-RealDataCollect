@@ -1,11 +1,16 @@
 """Collect synchronized data from DJI, RealSense RGB, robotic arm state, and pressure UDP data.
 
+Sampling rates:
+    - Visual (DJI + RealSense): 20Hz
+    - Tactile/Pressure: 200Hz
+    - Robot Arm State: 200Hz
+
 Press SPACE to start/stop individual recording sessions. Each session creates a
 timestamped folder containing:
-    - `dji/`             : DJI Osmo Action RGB frames
-    - `realsense_rgb/`   : Intel RealSense RGB frames
-    - `robot_state/`     : JSON snapshots of the arm pose/state per frame
-    - `pressure/`        : CSV pressure samples (`left/right`)
+    - `dji/`             : DJI Osmo Action RGB frames (20Hz)
+    - `realsense_rgb/`   : Intel RealSense RGB frames (20Hz)
+    - `robot_state/`     : CSV robot arm state at 200Hz
+    - `pressure/`        : CSV pressure samples at 200Hz
 
 Use Q or ESC to exit at any time.
 """
@@ -14,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import socket
 import struct
 import threading
@@ -40,6 +44,14 @@ DEFAULT_ARM_HOST = "192.168.31.92"
 DEFAULT_ARM_PORT = 8080
 MAX_PREVIEW_WIDTH = 1920
 
+# Sampling rates (Hz)
+VISUAL_FPS = 20          # 视觉采样率 20Hz
+TACTILE_FPS = 200        # 触觉/压力采样率 200Hz
+ROBOT_ARM_FPS = 200      # 机械臂状态采样率 200Hz
+
+VISUAL_INTERVAL_S = 1.0 / VISUAL_FPS      # 50ms
+ROBOT_ARM_INTERVAL_S = 1.0 / ROBOT_ARM_FPS  # 5ms
+
 DEFAULT_PRESSURE_LOCAL_PORT = 4321
 DEFAULT_PRESSURE_REMOTE_IP = "192.168.31.164"
 DEFAULT_PRESSURE_REMOTE_PORT = 2222
@@ -48,6 +60,9 @@ PRESSURE_PACKET_SIZE = struct.calcsize(PRESSURE_PACKET_FORMAT)
 PRESSURE_BUFFER_SIZE = PRESSURE_PACKET_SIZE
 PRESSURE_BATCH_SIZE = 100
 PRESSURE_FLUSH_INTERVAL_S = 0.1
+
+ROBOT_ARM_BATCH_SIZE = 100
+ROBOT_ARM_FLUSH_INTERVAL_S = 0.1
 
 
 class DJICamera:
@@ -156,34 +171,6 @@ class RealSenseRGB:
 
     def _zero_frame(self) -> np.ndarray:
         return np.zeros((self.height, self.width, 3), dtype=np.uint8)
-
-
-class RobotArmMonitor:
-    def __init__(self, host: str, port: int):
-        self.host = host
-        self.port = port
-        self.robot = RoboticArm(rm_thread_mode_e.RM_TRIPLE_MODE_E)
-        self.handle = None
-
-    def connect(self) -> None:
-        self.handle = self.robot.rm_create_robot_arm(self.host, self.port)
-        if self.handle is None:
-            raise RuntimeError("Failed to create robot arm handle.")
-        print(f"机械臂ID： {self.handle.id}")
-
-    def read_state(self) -> dict:
-        if self.handle is None:
-            raise RuntimeError("Robot arm not connected.")
-        status = self.robot.rm_get_current_arm_state()
-        if not isinstance(status, tuple) or len(status) != 2:
-            return {"code": -1, "data": None}
-        code, payload = status
-        return {"code": code, "data": payload}
-
-    def disconnect(self) -> None:
-        if self.handle is not None:
-            self.robot.rm_delete_robot_arm()
-            self.handle = None
 
 
 class PressureCollector:
@@ -328,12 +315,165 @@ class PressureCollector:
         self.last_flush_time = now
 
 
+class RobotArmCollector:
+    """Collect robot arm state at 200Hz in a separate thread."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        interval_s: float = ROBOT_ARM_INTERVAL_S,
+        batch_size: int = ROBOT_ARM_BATCH_SIZE,
+        flush_interval_s: float = ROBOT_ARM_FLUSH_INTERVAL_S,
+    ):
+        self.host = host
+        self.port = port
+        self.interval_s = interval_s
+        self.batch_size = batch_size
+        self.flush_interval_s = flush_interval_s
+
+        self.robot = RoboticArm(rm_thread_mode_e.RM_TRIPLE_MODE_E)
+        self.handle = None
+        self.thread: Optional[threading.Thread] = None
+        self.running = False
+
+        self.recording = False
+        self.csv_file = None
+        self.csv_writer: Optional[csv.writer] = None
+        self.row_buffer: list[list] = []
+        self.last_flush_time = time.time()
+
+        self.latest_state: dict = {"code": -1, "data": None}
+        self.latest_joints: Optional[list[float]] = None
+        self.latest_pose: Optional[list[float]] = None
+
+        self.lock = threading.Lock()
+
+    def connect(self) -> None:
+        self.handle = self.robot.rm_create_robot_arm(self.host, self.port)
+        if self.handle is None:
+            raise RuntimeError("Failed to create robot arm handle.")
+        print(f"机械臂ID： {self.handle.id}")
+
+    def start(self) -> None:
+        self.running = True
+        self.thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self.thread.start()
+        print(f"Robot arm collector started at {ROBOT_ARM_FPS}Hz")
+
+    def stop(self) -> None:
+        self.running = False
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)
+            self.thread = None
+        self.stop_session()
+        if self.handle is not None:
+            self.robot.rm_delete_robot_arm()
+            self.handle = None
+
+    def start_session(self, session_root: Path) -> None:
+        robot_dir = session_root / "robot_state"
+        robot_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = robot_dir / "robot_state.csv"
+
+        with self.lock:
+            self._stop_session_locked()
+            self.csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+            self.csv_writer = csv.writer(self.csv_file)
+            headers = ["timestamp_us"]
+            headers += [f"joint_{i+1}" for i in range(7)]
+            headers += [f"pose_{i+1}" for i in range(6)]
+            self.csv_writer.writerow(headers)
+            self.row_buffer = []
+            self.last_flush_time = time.time()
+            self.recording = True
+
+        print(f"Robot arm session file: {csv_path}")
+
+    def stop_session(self) -> None:
+        with self.lock:
+            self._stop_session_locked()
+
+    def _stop_session_locked(self) -> None:
+        self._flush_locked(force=True)
+        if self.csv_file is not None:
+            self.csv_file.close()
+            self.csv_file = None
+        self.csv_writer = None
+        self.recording = False
+
+    def get_latest_state(self) -> dict:
+        with self.lock:
+            return dict(self.latest_state)
+
+    def get_latest_joints(self) -> Optional[list[float]]:
+        with self.lock:
+            return list(self.latest_joints) if self.latest_joints else None
+
+    def get_latest_pose(self) -> Optional[list[float]]:
+        with self.lock:
+            return list(self.latest_pose) if self.latest_pose else None
+
+    def _poll_loop(self) -> None:
+        while self.running:
+            if self.handle is None:
+                time.sleep(0.1)
+                continue
+
+            try:
+                status = self.robot.rm_get_current_arm_state()
+                if not isinstance(status, tuple) or len(status) != 2:
+                    state = {"code": -1, "data": None}
+                else:
+                    code, payload = status
+                    state = {"code": code, "data": payload}
+            except Exception:
+                state = {"code": -1, "data": None}
+
+            timestamp_us = int(time.time() * 1e6)
+            payload = state.get("data") if isinstance(state, dict) else None
+            joints = payload.get("joint") if isinstance(payload, dict) else None
+            pose = payload.get("pose") if isinstance(payload, dict) else None
+
+            with self.lock:
+                self.latest_state = state
+                self.latest_joints = list(joints) if joints else None
+                self.latest_pose = list(pose) if pose else None
+
+                if self.recording and self.csv_writer is not None:
+                    row = [timestamp_us]
+                    row += list(joints) if joints else [0] * 7
+                    row += list(pose) if pose else [0] * 6
+                    self.row_buffer.append(row)
+                    self._flush_locked(force=False)
+
+            time.sleep(self.interval_s)
+
+    def _flush_locked(self, force: bool) -> None:
+        if not self.recording or self.csv_writer is None or self.csv_file is None:
+            return
+        if not self.row_buffer:
+            return
+
+        now = time.time()
+        should_flush = force or len(self.row_buffer) >= self.batch_size or (
+            now - self.last_flush_time
+        ) >= self.flush_interval_s
+
+        if not should_flush:
+            return
+
+        self.csv_writer.writerows(self.row_buffer)
+        self.csv_file.flush()
+        self.row_buffer.clear()
+        self.last_flush_time = now
+
+
 @dataclass
 class SessionPaths:
     root: Path
     dji: Path
     realsense: Path
-    robot_state: Path
     pressure: Path
 
 
@@ -342,7 +482,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dji-index", type=int, default=DEFAULT_DJI_INDEX, help="OpenCV index for DJI camera.")
     parser.add_argument("--width", type=int, default=1280, help="Frame width for both streams.")
     parser.add_argument("--height", type=int, default=720, help="Frame height for both streams.")
-    parser.add_argument("--fps", type=int, default=30, help="Target frame rate for RealSense color stream.")
     parser.add_argument("--output", type=Path, default=Path("sessions"), help="Base directory for recordings.")
     parser.add_argument(
         "--session-prefix",
@@ -364,14 +503,13 @@ def create_session_paths(base: Path, prefix: str) -> SessionPaths:
     session_root = base / f"{prefix}_{timestamp}"
     dji_dir = session_root / "dji"
     rs_dir = session_root / "realsense_rgb"
-    robot_dir = session_root / "robot_state"
     pressure_dir = session_root / "pressure"
 
-    for directory in (dji_dir, rs_dir, robot_dir, pressure_dir):
+    for directory in (dji_dir, rs_dir, pressure_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
     print(f"Recording session created: {session_root}")
-    return SessionPaths(root=session_root, dji=dji_dir, realsense=rs_dir, robot_state=robot_dir, pressure=pressure_dir)
+    return SessionPaths(root=session_root, dji=dji_dir, realsense=rs_dir, pressure=pressure_dir)
 
 
 def draw_pressure_dashboard(canvas: np.ndarray, x: int, y: int, frame_w: int, values: list[int]) -> None:
@@ -523,17 +661,6 @@ def compose_preview(
     return canvas
 
 
-def save_robot_state(directory: Path, frame_stem: str, state: dict) -> None:
-    payload = {
-        "timestamp": datetime.now().isoformat(),
-        "frame": frame_stem,
-        "state": state,
-    }
-    state_path = directory / f"{frame_stem}.json"
-    with state_path.open("w", encoding="utf-8") as file:
-        json.dump(payload, file, ensure_ascii=True, indent=2)
-
-
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -541,8 +668,8 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
 
     dji = DJICamera(index=args.dji_index, width=args.width, height=args.height)
-    rs_camera = RealSenseRGB(width=args.width, height=args.height, fps=args.fps)
-    robot = RobotArmMonitor(host=args.arm_host, port=args.arm_port)
+    rs_camera = RealSenseRGB(width=args.width, height=args.height, fps=VISUAL_FPS)
+    robot = RobotArmCollector(host=args.arm_host, port=args.arm_port)
     pressure = PressureCollector(
         local_port=args.pressure_local_port,
         remote_ip=args.pressure_remote_ip,
@@ -555,7 +682,9 @@ def main() -> None:
     rs_camera.start()
     print(f"Connecting robot arm at {args.arm_host}:{args.arm_port}...")
     robot.connect()
-    print("Starting pressure collector...")
+    print("Starting robot arm collector at 200Hz...")
+    robot.start()
+    print("Starting pressure collector at 200Hz...")
     pressure.start()
 
     recording = False
@@ -563,24 +692,48 @@ def main() -> None:
     frame_id = 0
     latest_state_text = "Joint: N/A"
     latest_pose_text = "Pose: N/A"
+    last_visual_time = 0.0
 
     print("Press SPACE to start/stop recording sessions, Q/ESC to exit.")
+    print(f"Sampling rates: Visual={VISUAL_FPS}Hz, Tactile={TACTILE_FPS}Hz, Robot Arm={ROBOT_ARM_FPS}Hz")
     cv2.namedWindow("DJI + RealSense", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("DJI + RealSense", 1920, 1080)
 
     try:
         while True:
+            now = time.time()
+
+            # Visual sampling at 20Hz (50ms interval)
+            if (now - last_visual_time) < VISUAL_INTERVAL_S:
+                # Still update display and check keys at higher rate
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), 27):
+                    print("Exiting capture loop.")
+                    break
+                if key == ord(" "):
+                    recording = not recording
+                    if recording:
+                        session_paths = create_session_paths(args.output, args.session_prefix)
+                        pressure.start_session(session_paths.root)
+                        robot.start_session(session_paths.root)
+                        frame_id = 0
+                        last_visual_time = now
+                    else:
+                        pressure.stop_session()
+                        robot.stop_session()
+                        session_paths = None
+                        frame_id = 0
+                        print("Recording paused. Press SPACE to start a new session.")
+                continue
+
+            last_visual_time = now
+
             dji_frame = dji.read()
             rs_frame = rs_camera.read()
 
-            try:
-                state = robot.read_state()
-            except RuntimeError as err:
-                state = {"code": -1, "error": str(err)}
-
-            payload = state.get("data") if isinstance(state, dict) else None
-            joints = payload.get("joint") if isinstance(payload, dict) else None
-            pose = payload.get("pose") if isinstance(payload, dict) else None
+            # Get latest state from robot arm collector (running at 200Hz)
+            joints = robot.get_latest_joints()
+            pose = robot.get_latest_pose()
             latest_state_text = "Joint: " + (" | ".join(f"{val:.1f}" for val in joints) if joints else "N/A")
             latest_pose_text = "Pose: " + (" | ".join(f"{val:.3f}" for val in pose) if pose else "N/A")
             latest_pressure_values = pressure.get_latest_values()
@@ -604,8 +757,6 @@ def main() -> None:
                 cv2.imwrite(str(session_paths.dji / image_name), dji_frame)
                 cv2.imwrite(str(session_paths.realsense / image_name), rs_frame)
 
-                save_robot_state(session_paths.robot_state, frame_stem, state)
-
                 frame_id += 1
 
             key = cv2.waitKey(1) & 0xFF
@@ -618,16 +769,19 @@ def main() -> None:
                 if recording:
                     session_paths = create_session_paths(args.output, args.session_prefix)
                     pressure.start_session(session_paths.root)
+                    robot.start_session(session_paths.root)
                     frame_id = 0
+                    last_visual_time = now
                 else:
                     pressure.stop_session()
+                    robot.stop_session()
                     session_paths = None
                     frame_id = 0
                     print("Recording paused. Press SPACE to start a new session.")
     finally:
         dji.stop()
         rs_camera.stop()
-        robot.disconnect()
+        robot.stop()
         pressure.stop()
         cv2.destroyAllWindows()
 
