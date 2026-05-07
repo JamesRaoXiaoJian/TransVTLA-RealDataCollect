@@ -212,9 +212,8 @@ class PressureCollector:
         self.csv_writer: Optional[csv.writer] = None
         self.row_buffer: list[list[int]] = []
 
-        self.latest_left: Optional[int] = None
-        self.latest_right: Optional[int] = None
         self.latest_timestamp_us: Optional[int] = None
+        self.latest_values: list[int] = [0] * 64
 
         self.last_flush_time = time.time()
 
@@ -255,7 +254,8 @@ class PressureCollector:
             self._stop_session_locked()
             self.csv_file = open(csv_path, "w", newline="", encoding="utf-8")
             self.csv_writer = csv.writer(self.csv_file)
-            self.csv_writer.writerow(["timestamp_us", "left", "right"])
+            headers = ["timestamp_us"] + [f"CH{i+1}" for i in range(64)]
+            self.csv_writer.writerow(headers)
             self.row_buffer = []
             self.last_flush_time = time.time()
             self.recording = True
@@ -274,11 +274,9 @@ class PressureCollector:
         self.csv_writer = None
         self.recording = False
 
-    def get_status_text(self) -> str:
+    def get_latest_values(self) -> list[int]:
         with self.lock:
-            if self.latest_left is None or self.latest_right is None:
-                return "Pressure: left N/A | right N/A"
-            return f"Pressure: left {self.latest_left} | right {self.latest_right}"
+            return list(self.latest_values)
 
     def _recv_loop(self) -> None:
         while self.running:
@@ -299,17 +297,15 @@ class PressureCollector:
                 continue
 
             timestamp_us, *values = struct.unpack(PRESSURE_PACKET_FORMAT, data)
-            left = values[63]   # CH64
-            right = values[62]  # CH63
 
             now = time.time()
             with self.lock:
                 self.latest_timestamp_us = timestamp_us
-                self.latest_left = left
-                self.latest_right = right
+                self.latest_values = list(values)
 
                 if self.recording and self.csv_writer is not None:
-                    self.row_buffer.append([timestamp_us, left, right])
+                    row = [timestamp_us] + self.latest_values
+                    self.row_buffer.append(row)
                     self._flush_locked(force=False)
 
     def _flush_locked(self, force: bool) -> None:
@@ -378,13 +374,115 @@ def create_session_paths(base: Path, prefix: str) -> SessionPaths:
     return SessionPaths(root=session_root, dji=dji_dir, realsense=rs_dir, robot_state=robot_dir, pressure=pressure_dir)
 
 
+def draw_pressure_dashboard(canvas: np.ndarray, x: int, y: int, frame_w: int, values: list[int]) -> None:
+    if not values or len(values) < 64:
+        return
+
+    LEFT_CHANNEL = 19
+    RIGHT_CHANNEL = 18
+    LEFT_MATRIX_CHANNELS = [[1, 16, 15], [14, 13, 12], [11, 10, 9]]
+    RIGHT_MATRIX_CHANNELS = [[17, 32, 31], [30, 29, 28], [27, 26, 25]]
+
+    def get_val(ch: int) -> int:
+        return values[ch - 1] if 0 <= ch - 1 < len(values) else 0
+
+    left_val = get_val(LEFT_CHANNEL)
+    right_val = get_val(RIGHT_CHANNEL)
+    left_mat = [[get_val(ch) for ch in row] for row in LEFT_MATRIX_CHANNELS]
+    right_mat = [[get_val(ch) for ch in row] for row in RIGHT_MATRIX_CHANNELS]
+
+    all_vals = [abs(left_val), abs(right_val)] + [abs(v) for row in left_mat for v in row] + [abs(v) for row in right_mat for v in row]
+    peak = float(max(1, max(all_vals)))
+
+    def get_color(val: int) -> tuple[int, int, int]:
+        ratio = min(1.0, abs(val) / peak)
+        b = int(40 + (255 - 40) * ratio)
+        g = int(40 + (100 - 40) * ratio)
+        r = int(40 + (50 - 40) * ratio)
+        return (b, g, r)
+
+    def draw_text_centered(img, text, cx, cy, font_scale=0.6, color=(255, 255, 255)):
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        th = 2 if font_scale > 0.5 else 1
+        sz, _ = cv2.getTextSize(text, font, font_scale, th)
+        cv2.putText(img, text, (int(cx - sz[0] / 2), int(cy + sz[1] / 2)), font, font_scale, color, th, cv2.LINE_AA)
+
+    col_w = frame_w // 3
+
+    # ==========================
+    # Column 1: Stacked L/R Bars
+    # ==========================
+    def draw_bar(bx: int, by: int, max_w: int, label: str, value: int) -> None:
+        bar_h = 40
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.9
+        th = 2
+        label_size, _ = cv2.getTextSize(label, font, font_scale, th)
+        label_w = label_size[0]
+        label_h = label_size[1]
+        
+        baseline_y = by + (bar_h + label_h) // 2 - 2
+        cv2.putText(canvas, label, (bx + 10, baseline_y), font, font_scale, (240, 240, 240), th, cv2.LINE_AA)
+
+        b_left = bx + 10 + label_w + 15
+        b_right = bx + max_w - 20
+        b_w = max(20, b_right - b_left)
+
+        ratio = min(1.0, abs(value) / peak)
+        fill_w = int(b_w * ratio)
+        if fill_w > 0:
+            cv2.rectangle(canvas, (b_left, by), (b_left + fill_w, by + bar_h), get_color(value), -1)
+        cv2.rectangle(canvas, (b_left, by), (b_right, by + bar_h), (100, 100, 100), 2)
+        draw_text_centered(canvas, f"{value:d}", b_left + b_w // 2, by + bar_h // 2, font_scale=0.7)
+
+    bar_start_y = y + 60
+    draw_bar(x, bar_start_y, col_w, "Left", left_val)
+    draw_bar(x, bar_start_y + 80, col_w, "Right", right_val)
+
+    # ==========================
+    # Column 2 & 3: Matrices
+    # ==========================
+    def draw_matrix(mx: int, label: str, matrix: list[list[int]]) -> None:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.8
+        th = 2
+        label_size, _ = cv2.getTextSize(label, font, font_scale, th)
+        label_w = label_size[0]
+        label_h = label_size[1]
+        
+        matrix_area_w = col_w - 30 - label_w
+        cell_gap = 8
+        cell_s = min(86, (matrix_area_w - cell_gap * 2) // 3)
+        matrix_side = cell_s * 3 + cell_gap * 2
+        
+        matrix_y = y + 20
+        label_y = matrix_y + matrix_side // 2 + label_h // 2
+        
+        cv2.putText(canvas, label, (mx + 10, label_y), font, font_scale, (240, 240, 240), th, cv2.LINE_AA)
+        
+        matrix_x = mx + 20 + label_w
+
+        for row_i in range(3):
+            for col_i in range(3):
+                cx = matrix_x + col_i * cell_s
+                cy = matrix_y + row_i * cell_s
+                val = matrix[row_i][col_i]
+                inner = cell_s - cell_gap
+                cv2.rectangle(canvas, (cx, cy), (cx + inner, cy + inner), get_color(val), -1)
+                cv2.rectangle(canvas, (cx, cy), (cx + inner, cy + inner), (100, 100, 100), 1)
+                draw_text_centered(canvas, str(val), cx + inner // 2, cy + inner // 2, font_scale=0.55)
+
+    draw_matrix(x + col_w, "Left Matrix", left_mat)
+    draw_matrix(x + col_w * 2, "Right Matrix", right_mat)
+
+
 def compose_preview(
     dji_frame: np.ndarray,
     rs_frame: np.ndarray,
     status_text: str,
     joint_text: str,
     pose_text: str,
-    pressure_text: str,
+    pressure_values: list[int],
 ) -> np.ndarray:
     target_height = max(dji_frame.shape[0], rs_frame.shape[0])
 
@@ -404,12 +502,18 @@ def compose_preview(
     top_canvas[:, : dji_resized.shape[1]] = dji_resized
     top_canvas[:, dji_resized.shape[1] + gap :] = rs_resized
 
-    info_height = 165
+    info_height = 420
     info_panel = np.zeros((info_height, top_width, 3), dtype=np.uint8)
+    
+    # Left side details
     cv2.putText(info_panel, status_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.05, (0, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(info_panel, joint_text, (20, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (220, 220, 220), 2, cv2.LINE_AA)
     cv2.putText(info_panel, pose_text, (20, 114), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (220, 220, 220), 2, cv2.LINE_AA)
-    cv2.putText(info_panel, pressure_text, (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (180, 255, 180), 2, cv2.LINE_AA)
+
+    # Dashboard placement inside info_panel
+    # Split the info panel width to layout the pressure views
+    # Assuming large screen layout. We give the dashboard right half or whole width under text.
+    draw_pressure_dashboard(info_panel, 20, 140, top_width - 40, pressure_values)
 
     canvas = np.vstack((top_canvas, info_panel))
     if canvas.shape[1] > MAX_PREVIEW_WIDTH:
@@ -462,6 +566,7 @@ def main() -> None:
 
     print("Press SPACE to start/stop recording sessions, Q/ESC to exit.")
     cv2.namedWindow("DJI + RealSense", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("DJI + RealSense", 1920, 1080)
 
     try:
         while True:
@@ -478,7 +583,7 @@ def main() -> None:
             pose = payload.get("pose") if isinstance(payload, dict) else None
             latest_state_text = "Joint: " + (" | ".join(f"{val:.1f}" for val in joints) if joints else "N/A")
             latest_pose_text = "Pose: " + (" | ".join(f"{val:.3f}" for val in pose) if pose else "N/A")
-            latest_pressure_text = pressure.get_status_text()
+            latest_pressure_values = pressure.get_latest_values()
 
             status = "REC" if recording else "IDLE"
             preview = compose_preview(
@@ -487,7 +592,7 @@ def main() -> None:
                 f"Status: {status} | Frames: {frame_id if recording else 0}",
                 latest_state_text,
                 latest_pose_text,
-                latest_pressure_text,
+                latest_pressure_values,
             )
             cv2.imshow("DJI + RealSense", preview)
 

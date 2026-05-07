@@ -344,7 +344,23 @@ def main() -> None:
                 break
 
             try:
+                # Wait for the first packet via blocking (with timeout)
+                # to prevent looping/consuming 100% CPU when no data
                 data, addr = sock.recvfrom(BUFFER_SIZE)
+                
+                # Drain the UDP socket to only process the latest packet
+                sock.setblocking(False)
+                while True:
+                    try:
+                        next_data, addr = sock.recvfrom(BUFFER_SIZE)
+                        data = next_data
+                    except (BlockingIOError, socket.timeout):
+                        break
+                
+                # Reset to blocking with timeout
+                sock.setblocking(True)
+                sock.settimeout(SOCKET_TIMEOUT_S)
+                
             except socket.timeout:
                 plt.pause(0.001)
                 continue
