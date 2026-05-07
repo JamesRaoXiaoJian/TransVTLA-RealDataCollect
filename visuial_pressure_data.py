@@ -31,7 +31,7 @@ from matplotlib.colors import Normalize
 UDP_PORT = 4321
 PACKET_FORMAT = "<Q64h"
 PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
-BUFFER_SIZE = PACKET_SIZE
+BUFFER_SIZE = 136
 PACKET_VALUE_COUNT = 64
 
 # Remote device for handshake (adjust if needed)
@@ -40,7 +40,7 @@ REMOTE_PORT = 2222
 
 UNIT_LABEL = "a.u."
 COLORMAP_NAME = "Blues"
-SOCKET_TIMEOUT_S = 0.1
+SOCKET_TIMEOUT_S = 1.0
 
 LEFT_CHANNEL = 18
 RIGHT_CHANNEL = 19
