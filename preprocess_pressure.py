@@ -172,6 +172,9 @@ def process_single_csv(csv_path: Path) -> np.ndarray:
 def process_all_sessions(data_root: Path, output_path: Path) -> None:
     """遍历 data_root 下所有 pressure.csv，合并处理后保存。
 
+    同时将每个 session 的结果单独保存到 session 目录下的
+    preprocessed_pressure/{session_name}.npz，供 RLDS 构建脚本使用。
+
     目录结构约定：
         data_root/**/pressure/pressure.csv
     """
@@ -187,7 +190,8 @@ def process_all_sessions(data_root: Path, output_path: Path) -> None:
     session_info: list[dict] = []
 
     for csv_path in csv_files:
-        session_name = csv_path.parent.parent.name
+        session_dir = csv_path.parent.parent
+        session_name = session_dir.name
         try:
             windows = process_single_csv(csv_path)
         except Exception as e:
@@ -205,6 +209,21 @@ def process_all_sessions(data_root: Path, output_path: Path) -> None:
             "samples": windows.shape[0],
         })
         print(f"  {session_name}: {windows.shape[0]} 个样本")
+
+        # 按 session 单独保存到 preprocessed_pressure/{session_name}.npz
+        per_session_dir = session_dir / "preprocessed_pressure"
+        per_session_dir.mkdir(parents=True, exist_ok=True)
+        per_session_path = per_session_dir / f"{session_name}.npz"
+        np.savez_compressed(
+            per_session_path,
+            data=windows,
+            channels=np.array(VALID_CHANNELS),
+            window_size=WINDOW_SIZE,
+            stride=STRIDE,
+            max_pressure_drop=MAX_PRESSURE_DROP,
+            baseline_rows=BASELINE_ROWS,
+        )
+        print(f"    -> 已保存: {per_session_path}")
 
     if not all_windows:
         print("无有效数据可处理")

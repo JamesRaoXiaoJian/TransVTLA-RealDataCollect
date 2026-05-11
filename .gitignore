@@ -49,3 +49,10 @@ sample_output/
 *.mp4
 *.avi
 *.mov
+
+# UV lock file (regenerate with `uv lock`)
+uv.lock
+
+# Preprocessed data outputs
+processed_data.npz
+phase2_rlds_output/

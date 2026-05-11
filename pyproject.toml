@@ -1,0 +1,12 @@
+[project]
+name = "phase2-rlds-env"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    "numpy<2",
+    "opencv-python>=4.11.0.86",
+    "pandas>=2.3.3",
+    "tensorflow>=2.16",
+    "tensorflow-datasets>=4.9",
+]
