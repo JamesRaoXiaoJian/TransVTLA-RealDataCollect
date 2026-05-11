@@ -249,9 +249,9 @@ def draw_colorbar(canvas: np.ndarray, x: int, y: int, w: int, h: int, peak: floa
         ty = y + int(frac * h)
         val = peak * (1.0 - frac)
         cv2.putText(canvas, f"{val:.0f}", (x + w + 8, ty + 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 1, cv2.LINE_AA)
     cv2.putText(canvas, "Peak", (x + w // 2 - 14, y - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 1, cv2.LINE_AA)
 
 
 # ─── Pressure dashboard ──────────────────────────────────────────────────────
@@ -266,9 +266,10 @@ def draw_pressure_dashboard(
     canvas: np.ndarray,
     left_x: int, left_w: int,
     right_x: int, right_w: int,
-    y: int, values: list[int],
+    bar_centers: list[int], total_h: int,
+    values: list[int],
 ) -> None:
-    """Draw left column (info+bars) and right area (two matrices + colorbar)."""
+    """Draw left column bars and right area matrices + colorbar."""
     if not values or len(values) < 64:
         return
 
@@ -285,38 +286,36 @@ def draw_pressure_dashboard(
     all_abs += [abs(v) for row in right_mat for v in row]
     peak = float(max(1, max(all_abs)))
 
-    # ── Left column: Left/Right horizontal bars ──
-    bar_h = 30
-    bar_y = y + 8
-    bar_gap = 16
-    single_w = (left_w - bar_gap) // 2
+    # ── Left column: two horizontal bars stacked vertically, left-aligned ──
+    bar_h = 28
 
-    for i, (label, value) in enumerate([("Left", left_val), ("Right", right_val)]):
-        bx = left_x + i * (single_w + bar_gap)
-        cv2.putText(canvas, label, (bx, bar_y - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (170, 170, 170), 1, cv2.LINE_AA)
-        by = bar_y + 6
+    for label, value, cy in [("Left", left_val, bar_centers[0]),
+                              ("Right", right_val, bar_centers[1])]:
+        bx = left_x
+        by = cy - bar_h // 2
+        cv2.putText(canvas, label, (bx, by - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 60, 60), 1, cv2.LINE_AA)
         ratio = min(1.0, abs(value) / peak)
-        fill_w = int(single_w * ratio)
+        fill_w = int(left_w * ratio)
         if fill_w > 0:
             cv2.rectangle(canvas, (bx, by), (bx + fill_w, by + bar_h),
                           pressure_color(ratio, 1.0), -1)
-        cv2.rectangle(canvas, (bx, by), (bx + single_w, by + bar_h), (80, 80, 80), 1)
-        draw_text_centered(canvas, f"{value:d}", bx + single_w // 2, by + bar_h // 2,
-                           font_scale=0.5, color=(255, 255, 255), thickness=1)
+        cv2.rectangle(canvas, (bx, by), (bx + left_w, by + bar_h), (160, 160, 160), 1)
+        text_c = (255, 255, 255) if ratio > 0.45 else (40, 40, 40)
+        draw_text_centered(canvas, f"{value:d}", bx + left_w // 2, by + bar_h // 2,
+                           font_scale=0.6, color=text_c, thickness=1)
 
-    # ── Right area: two 3x3 matrices side by side + colorbar ──
+    # ── Right area: two 3x3 matrices side by side + colorbar (no labels) ──
     mat_w = CELL_SIZE * 3 + CELL_GAP * 2
     mat_h = mat_w
     colorbar_w = 20
-    mat_gap = 30
-    total_mat_area = mat_w * 2 + mat_gap + colorbar_w + 20
+    mat_gap = 50
+    cb_gap = 40
+    total_mat_area = mat_w * 2 + mat_gap + colorbar_w + cb_gap
     mat_origin_x = right_x + (right_w - total_mat_area) // 2
-    mat_y = y
+    mat_y = (total_h - mat_h) // 2
 
-    def draw_matrix(mx: int, my: int, label: str, matrix: list[list[int]]) -> None:
-        cv2.putText(canvas, label, (mx, my - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (170, 170, 170), 1, cv2.LINE_AA)
+    def draw_matrix(mx: int, my: int, matrix: list[list[int]]) -> None:
         for ri in range(3):
             for ci in range(3):
                 cx = mx + ci * (CELL_SIZE + CELL_GAP)
@@ -326,14 +325,14 @@ def draw_pressure_dashboard(
                 color = pressure_color(ratio, 1.0)
                 cv2.rectangle(canvas, (cx, cy), (cx + CELL_SIZE, cy + CELL_SIZE), color, -1)
                 cv2.rectangle(canvas, (cx, cy), (cx + CELL_SIZE, cy + CELL_SIZE), (60, 60, 60), 2)
-                text_c = (255, 255, 255) if ratio > 0.35 else (200, 200, 200)
+                text_c = (255, 255, 255) if ratio > 0.4 else (40, 40, 40)
                 draw_text_centered(canvas, str(val), cx + CELL_SIZE // 2, cy + CELL_SIZE // 2,
-                                   font_scale=0.55, color=text_c, thickness=1)
+                                   font_scale=0.6, color=text_c, thickness=1)
 
-    draw_matrix(mat_origin_x, mat_y, "Left", left_mat)
-    draw_matrix(mat_origin_x + mat_w + mat_gap, mat_y, "Right", right_mat)
+    draw_matrix(mat_origin_x, mat_y, left_mat)
+    draw_matrix(mat_origin_x + mat_w + mat_gap, mat_y, right_mat)
 
-    cb_x = mat_origin_x + mat_w * 2 + mat_gap + 10
+    cb_x = mat_origin_x + mat_w * 2 + mat_gap + cb_gap
     draw_colorbar(canvas, cb_x, mat_y, colorbar_w, mat_h, peak)
 
 
@@ -367,26 +366,34 @@ def compose_canvas(
     # ── Info panel: left 40% (info+bars), right 60% (matrices) ──
     margin = 20
     state_lines = state_text.splitlines()
-    header_h = 28 + len(state_lines) * 22 + 8
 
-    mat_block_w = CELL_SIZE * 3 + CELL_GAP * 2  # 268px
-    mat_h = mat_block_w
+    mat_h = CELL_SIZE * 3 + CELL_GAP * 2
 
     left_w = int((width - margin * 2) * 0.4)
     right_w = width - margin * 2 - left_w
     left_x = margin
     right_x = left_x + left_w
 
-    info_height = header_h + mat_h + 30
-    info = np.full((info_height, width, 3), BG_COLOR, dtype=np.uint8)
+    # All left column items: frame_label, joint, pose, Left, Right
+    # The bars are drawn by draw_pressure_dashboard; we only draw text here
+    n_text_items = 1 + len(state_lines)  # frame_label + joint + pose
+    n_total = n_text_items + 2  # + Left bar + Right bar
+    info_height = mat_h + 40
 
-    # Session info header (spans full width)
-    cv2.putText(info, frame_label, (left_x, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (80, 200, 255), 2, cv2.LINE_AA)
-    for i, line in enumerate(state_lines, start=1):
-        cv2.putText(info, line, (left_x, 22 + i * 22), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (190, 190, 190), 1, cv2.LINE_AA)
+    info = np.full((info_height, width, 3), (255, 255, 255), dtype=np.uint8)
 
-    # Dashboard: left column = bars, right area = matrices
-    draw_pressure_dashboard(info, left_x, left_w, right_x, right_w, header_h, pressure_values)
+    # Evenly distribute text items across full height (bars will fill remaining slots)
+    item_spacing = info_height // (n_total + 1)
+    for i, line in enumerate([frame_label] + state_lines):
+        y_pos = item_spacing * (i + 1)
+        if i == 0:
+            cv2.putText(info, line, (left_x, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (30, 100, 200), 2, cv2.LINE_AA)
+        else:
+            cv2.putText(info, line, (left_x, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (50, 50, 50), 1, cv2.LINE_AA)
+
+    # Dashboard: left column = bars at evenly spaced positions, right area = matrices
+    bar_positions = [item_spacing * (n_text_items + 1), item_spacing * (n_text_items + 2)]
+    draw_pressure_dashboard(info, left_x, left_w, right_x, right_w, bar_positions, info_height, pressure_values)
 
     canvas = np.vstack((top, info))
     return canvas
@@ -477,14 +484,34 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _print_hint() -> None:
+    print("\n" + "=" * 50)
+    print("  ← →   前/后帧")
+    print("  N / M  下一个/上一个 session")
+    print("  B      返回选择列表")
+    print("  Q/ESC  退出")
+    print("=" * 50 + "\n")
+
+
 def _open_viewer(sessions: List[Path], idx: int) -> int:
-    """Open viewer for session at idx. Returns next action: -1=quit, 0=selector."""
+    """Open viewer for session at idx.
+    Returns: -1=quit, 0=selector, positive=new session index to open.
+    """
     viewer = SessionViewer(sessions[idx], idx, len(sessions))
     viewer.render()
+    _print_hint()
 
     while True:
         key = cv2.waitKey(50) & 0xFFFF
         ch = key & 0xFF
+
+        # Window closed via X button
+        try:
+            if cv2.getWindowProperty(viewer.window, cv2.WND_PROP_VISIBLE) < 1:
+                cv2.destroyAllWindows()
+                return -1
+        except cv2.error:
+            return -1
 
         if ch in (ord("q"), 27):
             cv2.destroyWindow(viewer.window)
@@ -496,6 +523,16 @@ def _open_viewer(sessions: List[Path], idx: int) -> int:
         if ch == ord("b") or ch == ord("B"):
             cv2.destroyWindow(viewer.window)
             return 0
+        if ch == ord("n") or ch == ord("N"):
+            cv2.destroyWindow(viewer.window)
+            new_idx = (idx + 1) % len(sessions)
+            print(f"→ 切换到 session [{new_idx + 1}/{len(sessions)}]: {sessions[new_idx].name}")
+            return new_idx
+        if ch == ord("m") or ch == ord("M"):
+            cv2.destroyWindow(viewer.window)
+            new_idx = (idx - 1) % len(sessions)
+            print(f"→ 切换到 session [{new_idx + 1}/{len(sessions)}]: {sessions[new_idx].name}")
+            return new_idx
 
 
 def main() -> None:
@@ -506,13 +543,22 @@ def main() -> None:
 
     # If --session specified, skip selector
     if args.session:
+        start_idx = None
         for i, s in enumerate(sessions):
             if s.name == args.session:
-                if _open_viewer(sessions, i) == 0:
-                    pass  # fall through to selector
+                start_idx = i
+                break
+        if start_idx is None:
+            raise SystemExit(f"Session '{args.session}' not found under {args.sessions}.")
+        idx = start_idx
+        while True:
+            action = _open_viewer(sessions, idx)
+            if action < 0:
                 cv2.destroyAllWindows()
                 return
-        raise SystemExit(f"Session '{args.session}' not found under {args.sessions}.")
+            if action == 0:
+                break  # fall through to selector
+            idx = action
 
     # Main loop: selector -> viewer -> selector -> ...
     while True:
@@ -520,9 +566,15 @@ def main() -> None:
         idx = selector.run()
         if idx < 0:
             break
-        action = _open_viewer(sessions, idx)
-        if action < 0:
-            break
+        # Viewer loop: stays until quit (-1) or back to selector (0)
+        while True:
+            action = _open_viewer(sessions, idx)
+            if action < 0:
+                cv2.destroyAllWindows()
+                return
+            if action == 0:
+                break
+            idx = action  # N/M session switch
 
     cv2.destroyAllWindows()
 
