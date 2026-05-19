@@ -24,6 +24,8 @@ dist/
 .coverage
 coverage.xml
 htmlcov/
+test_5-8.zip
+processed_data.npz
 
 # Local editor and OS files
 .vscode/
