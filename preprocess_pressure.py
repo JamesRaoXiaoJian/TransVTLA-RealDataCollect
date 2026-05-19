@@ -169,14 +169,17 @@ def process_single_csv(csv_path: Path) -> np.ndarray:
     return windows
 
 
-def process_all_sessions(data_root: Path, output_path: Path) -> None:
-    """遍历 data_root 下所有 pressure.csv，合并处理后保存。
+def process_all_sessions(data_root: Path, output_path: Path | None = None) -> None:
+    """遍历 data_root 下所有 pressure.csv，按 session 保存，并可选合并保存。
 
     同时将每个 session 的结果单独保存到 session 目录下的
     preprocessed_pressure/{session_name}.npz，供 RLDS 构建脚本使用。
 
     目录结构约定：
         data_root/**/pressure/pressure.csv
+    输出到：
+        data_root/**/preprocessed_pressure/session_name.npz
+        output_path（可选）合并所有 session 后的 .npz
     """
     csv_files = sorted(data_root.rglob("pressure/pressure.csv"))
 
@@ -188,6 +191,7 @@ def process_all_sessions(data_root: Path, output_path: Path) -> None:
 
     all_windows: list[np.ndarray] = []
     session_info: list[dict] = []
+    total_samples = 0
 
     for csv_path in csv_files:
         session_dir = csv_path.parent.parent
@@ -208,14 +212,13 @@ def process_all_sessions(data_root: Path, output_path: Path) -> None:
             "csv": str(csv_path),
             "samples": windows.shape[0],
         })
-        print(f"  {session_name}: {windows.shape[0]} 个样本")
 
-        # 按 session 单独保存到 preprocessed_pressure/{session_name}.npz
-        per_session_dir = session_dir / "preprocessed_pressure"
-        per_session_dir.mkdir(parents=True, exist_ok=True)
-        per_session_path = per_session_dir / f"{session_name}.npz"
+        # 保存到 session 同级的 preprocessed_pressure 目录
+        out_dir = csv_path.parent.parent / "preprocessed_pressure"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{session_name}.npz"
         np.savez_compressed(
-            per_session_path,
+            out_path,
             data=windows,
             channels=np.array(VALID_CHANNELS),
             window_size=WINDOW_SIZE,
@@ -223,18 +226,22 @@ def process_all_sessions(data_root: Path, output_path: Path) -> None:
             max_pressure_drop=MAX_PRESSURE_DROP,
             baseline_rows=BASELINE_ROWS,
         )
-        print(f"    -> 已保存: {per_session_path}")
+        total_samples += windows.shape[0]
+        print(f"  {session_name}: {windows.shape[0]} 个样本 -> {out_path}")
 
-    if not all_windows:
-        print("无有效数据可处理")
+    print(f"\n共处理 {total_samples} 个样本")
+
+    if output_path is None:
         return
 
-    # 合并所有 session 的样本
+    if not all_windows:
+        print("无有效数据可合并")
+        return
+
     merged = np.concatenate(all_windows, axis=0)
-    print(f"\n合并后总样本数: {merged.shape[0]}")
+    print(f"合并后总样本数: {merged.shape[0]}")
     print(f"张量形状: {merged.shape}  (Samples, {WINDOW_SIZE}, 20)")
 
-    # 保存为 .npz（包含数据和元信息）
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
@@ -244,8 +251,9 @@ def process_all_sessions(data_root: Path, output_path: Path) -> None:
         stride=STRIDE,
         max_pressure_drop=MAX_PRESSURE_DROP,
         baseline_rows=BASELINE_ROWS,
+        session_info=np.array(session_info, dtype=object),
     )
-    print(f"已保存: {output_path} ({output_path.stat().st_size / 1024:.1f} KB)")
+    print(f"已保存合并数据: {output_path} ({output_path.stat().st_size / 1024:.1f} KB)")
 
 
 # ============================================================
@@ -332,8 +340,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="柔性触觉传感器数据预处理")
     parser.add_argument("--data-root", type=Path, default=Path("sessions"),
                         help="数据根目录（包含 pressure/pressure.csv 的父目录）")
-    parser.add_argument("--output", type=Path, default=Path("processed_data.npz"),
-                        help="输出文件路径（.npz 格式）")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="可选：合并所有 session 后的输出 .npz 文件路径")
     parser.add_argument("--test", action="store_true",
                         help="运行内置测试验证处理逻辑")
     args = parser.parse_args()
