@@ -15,9 +15,10 @@
 
 - `Robotic_Arm/`：机械臂 Python SDK，本仓库已内置。
 - `camera_data.py`：DJI + RealSense 的预览/小批量采集工具。
-- `collect_data.py`：DJI + RealSense 的交互式录制工具。
-- `collect_all_data.py`：DJI + RealSense + 机械臂状态的同步采集工具。
-- `collect_all_data_with_pressure.py`：在上面的基础上增加压力 UDP 数据保存。
+- `collect_vision.py`：DJI + RealSense 的交互式录制工具。
+- `collect_robot.py`：DJI + RealSense + 机械臂状态的同步采集工具。
+- `collect_pressure.py`：DJI + RealSense + 机械臂状态 + 压力 UDP 数据保存。
+- `collect_gripper.py`：在压力采集基础上增加知行夹爪 Modbus 状态采集。
 - `data_viwer.py`：离线浏览已采集 session 的工具。
 - `pressure_data.py`：压力 UDP 数据接收并保存为 CSV。
 - `herong_9_pressure_data.py`：压力数据的终端实时显示工具。
@@ -82,7 +83,7 @@ python camera_data.py --list-cameras
 - `--frame-count`：采集帧组数。
 - `--depth-preview`：是否显示/保存深度伪彩色图。
 
-### `collect_data.py`
+### `collect_vision.py`
 
 用途：交互式采集 DJI + RealSense RGB，同步保存到按时间戳命名的 session 目录。
 
@@ -94,10 +95,10 @@ python camera_data.py --list-cameras
 示例：
 
 ```bash
-python collect_data.py --output sessions
+python collect_vision.py --output sessions
 ```
 
-### `collect_all_data.py`
+### `collect_robot.py`
 
 用途：采集 DJI + RealSense RGB + 机械臂状态。
 
@@ -109,7 +110,7 @@ python collect_data.py --output sessions
 示例：
 
 ```bash
-python collect_all_data.py --arm-host 192.168.31.92 --arm-port 8080
+python collect_robot.py --arm-host 192.168.31.92 --arm-port 8080
 ```
 
 常用参数：
@@ -118,7 +119,7 @@ python collect_all_data.py --arm-host 192.168.31.92 --arm-port 8080
 - `--arm-port`：机械臂控制器端口。
 - `--output`：session 保存目录。
 
-### `collect_all_data_with_pressure.py`
+### `collect_pressure.py`
 
 用途：采集 DJI + RealSense RGB + 机械臂状态 + 压力 UDP 数据。
 
@@ -131,7 +132,7 @@ python collect_all_data.py --arm-host 192.168.31.92 --arm-port 8080
 示例：
 
 ```bash
-python collect_all_data_with_pressure.py --arm-host 192.168.31.92 --arm-port 8080
+python collect_pressure.py --arm-host 192.168.31.92 --arm-port 8080
 ```
 
 常用参数：
@@ -140,6 +141,27 @@ python collect_all_data_with_pressure.py --arm-host 192.168.31.92 --arm-port 808
 - `--arm-port`：机械臂控制器端口。
 - `--output`：session 保存目录。
 - `--dji-index`：DJI 摄像头索引。
+
+### `collect_gripper.py`
+
+用途：采集 DJI + RealSense RGB + 机械臂状态 + 压力 UDP 数据 + 知行夹爪 Modbus 状态。
+
+新增内容：
+
+- 录制期间将夹爪目标位置寄存器读数写入 `robot_state/gripper_state.csv`。
+- 夹爪状态包含 `position_value`、读取返回码、读取耗时和调度延迟。
+
+示例：
+
+```bash
+python collect_gripper.py --arm-host 172.25.5.243 --arm-port 8080
+```
+
+常用参数：
+
+- `--disable-gripper`：关闭夹爪状态采集。
+- `--gripper-no-setup`：不自动开启 24V 和 Modbus 模式。
+- `--gripper-keep-power`：退出时不关闭末端 24V。
 
 ### `data_viwer.py`
 
@@ -234,7 +256,7 @@ python test.py
 1. 先运行 `connect_robot.py` 或 `test.py`，确认机械臂可连接。
 2. 再用 `camera_data.py` 检查 DJI 和 RealSense 是否正常出图。
 3. 使用 `pressure_data.py` 或 `herong_9_pressure_data.py` 验证压力通信。
-4. 最后运行 `collect_all_data.py` 或 `collect_all_data_with_pressure.py` 开始正式采集。
+4. 最后按需要运行 `collect_robot.py`、`collect_pressure.py` 或 `collect_gripper.py` 开始正式采集。
 
 ## 采集注意事项
 
