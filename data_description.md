@@ -30,7 +30,7 @@ sessions/
 │       │   └── ...
 │       └── robot_state/                   # 机械臂与夹爪状态
 │           ├── robot_state.csv            # 机械臂关节与末端位姿
-│           └── gripper_state.csv          # 可选，知行夹爪 Modbus 状态
+│           └── gripper_state.csv          # 可选，夹爪 RM Plus 实时状态
 ```
 
 不同采集脚本生成的数据范围不同：
@@ -71,43 +71,37 @@ CSV 格式，14 列：
 
 ### 3. 夹爪状态 — `robot_state/gripper_state.csv`
 
-该文件仅由 `collect_gripper.py` 生成，用于记录知行 CTAG2F120 夹爪的 Modbus 寄存器读数。
+该文件仅由 `collect_gripper.py` 生成，用于记录官方状态读取 API 返回的夹爪实时状态。
 
-CSV 格式，10 列：
+CSV 格式，12 列：
 
 | 列名 | 类型 | 说明 |
 |------|------|------|
 | `timestamp_us` | int | 采样时间戳（微秒，采集端系统时间） |
 | `target_hz` | int | 目标采样率，当前为 200 |
-| `position_read_code` | int | 读取位置寄存器返回码，0 表示成功 |
-| `position_read_latency_ms` | float | 本次 Modbus 读取耗时，单位毫秒 |
-| `position_b0` | int/空 | 位置寄存器第 1 字节 |
-| `position_b1` | int/空 | 位置寄存器第 2 字节 |
-| `position_b2` | int/空 | 位置寄存器第 3 字节 |
-| `position_b3` | int/空 | 位置寄存器第 4 字节 |
-| `position_value` | int/空 | 由 4 字节大端解码得到的位置值，范围通常为 0~1000 |
+| `rm_plus_read_code` | int | `rm_get_rm_plus_state_info()` 返回码，0 表示成功 |
+| `rm_plus_read_latency_ms` | float | 本次状态读取耗时，单位毫秒 |
+| `sys_state` | int/空 | 末端设备系统状态 |
+| `gripper_pos` | int/空 | 夹爪开合值，来源于 `dist["pos"][0]` |
+| `gripper_speed` | int/空 | 夹爪速度，来源于 `dist["speed"][0]` |
+| `gripper_current` | int/空 | 夹爪电流，来源于 `dist["current"][0]` |
+| `gripper_force` | int/空 | 夹爪力，来源于 `dist["force"][0]` |
+| `gripper_dof_state` | int/空 | 第 0 自由度状态，来源于 `dist["dof_state"][0]` |
+| `gripper_dof_err` | int/空 | 第 0 自由度错误码，来源于 `dist["dof_err"][0]` |
 | `deadline_late_ms` | float | 相对 200 Hz 调度周期的延迟，单位毫秒 |
 
-位置寄存器地址为 `258`，读取 2 个 Modbus 寄存器，即 4 个字节。解码方式：
+采集调用：
 
 ```python
-position_value = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+code, dist = arm.rm_get_rm_plus_state_info()
+gripper_pos = dist["pos"][0]
 ```
-
-常见位置值：
-
-| 夹爪位置 | 字节值 | 十进制 |
-|----------|--------|--------|
-| 打开 | `[0, 0, 0, 0]` | 0 |
-| 中间 | `[0, 0, 1, 244]` | 500 |
-| 闭合 | `[0, 0, 3, 232]` | 1000 |
 
 注意：
 
-- `position_value` 是 Modbus 位置寄存器读回值，主要表示最近写入/保持的目标位置。
-- 它不一定等同于实时物理开口位置。
-- 当前通过睿尔曼 API 轮询 Modbus 的实测速度低于 200 Hz，通常受 `position_read_latency_ms` 限制。
-- 后处理时应使用 `timestamp_us` 和 `position_read_latency_ms` 判断真实同步质量。
+- 采集代码只读取状态，不下发夹爪动作。
+- 夹爪动作可由控制程序使用 `arm.rm_set_gripper_position()` 等官方接口完成。
+- 后处理时应使用 `timestamp_us` 和 `rm_plus_read_latency_ms` 判断真实同步质量。
 
 ### 4. 相机图像 — `realsense_rgb/` & `dji/`
 
@@ -208,14 +202,14 @@ $$P_{norm} = \text{clip}\left(\frac{\Delta P}{3500},\ 0,\ 1\right)$$
 | RealSense 图像 | `realsense_rgb/XXXX.jpg` | 文件序号对应视觉采样顺序 | 20 Hz |
 | 压力 | `pressure/pressure.csv` | `timestamp_us`，来自压力数据包 | 200 Hz |
 | 机械臂 | `robot_state/robot_state.csv` | `timestamp_us`，采集端系统时间 | 200 Hz |
-| 夹爪 | `robot_state/gripper_state.csv` | `timestamp_us`，采集端系统时间 | 200 Hz 目标，实际取决于 Modbus 读取耗时 |
+| 夹爪 | `robot_state/gripper_state.csv` | `timestamp_us`，采集端系统时间 | 200 Hz 目标，实际取决于状态读取耗时 |
 
 对齐建议：
 
 - 图像以帧序号和采集 session 时间作为低频参考。
 - 压力、机械臂、夹爪使用 `timestamp_us` 做最近邻或线性插值对齐。
-- 夹爪数据需要同时检查 `position_read_code == 0`。
-- 如果 `position_read_latency_ms` 或 `deadline_late_ms` 较大，说明该行夹爪数据的实时性较差。
+- 夹爪数据需要同时检查 `rm_plus_read_code == 0`。
+- 如果 `rm_plus_read_latency_ms` 或 `deadline_late_ms` 较大，说明该行夹爪数据的实时性较差。
 
 ## 使用方法
 

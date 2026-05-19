@@ -18,7 +18,7 @@
 - `collect_vision.py`：DJI + RealSense 的交互式录制工具。
 - `collect_robot.py`：DJI + RealSense + 机械臂状态的同步采集工具。
 - `collect_pressure.py`：DJI + RealSense + 机械臂状态 + 压力 UDP 数据保存。
-- `collect_gripper.py`：在压力采集基础上增加知行夹爪 Modbus 状态采集。
+- `collect_gripper.py`：在压力采集基础上增加夹爪官方状态 API 读取。
 - `data_viwer.py`：离线浏览已采集 session 的工具。
 - `pressure_data.py`：压力 UDP 数据接收并保存为 CSV。
 - `herong_9_pressure_data.py`：压力数据的终端实时显示工具。
@@ -144,12 +144,12 @@ python collect_pressure.py --arm-host 192.168.31.92 --arm-port 8080
 
 ### `collect_gripper.py`
 
-用途：采集 DJI + RealSense RGB + 机械臂状态 + 压力 UDP 数据 + 知行夹爪 Modbus 状态。
+用途：采集 DJI + RealSense RGB + 机械臂状态 + 压力 UDP 数据 + 夹爪官方状态 API 数据。
 
 新增内容：
 
-- 录制期间将夹爪目标位置寄存器读数写入 `robot_state/gripper_state.csv`。
-- 夹爪状态包含 `position_value`、读取返回码、读取耗时和调度延迟。
+- 录制期间调用 `rm_get_rm_plus_state_info()`，将夹爪实时状态写入 `robot_state/gripper_state.csv`。
+- 夹爪开合值记录为 `gripper_pos`，来源于 `dist["pos"][0]`。
 
 示例：
 
@@ -160,8 +160,6 @@ python collect_gripper.py --arm-host 172.25.5.243 --arm-port 8080
 常用参数：
 
 - `--disable-gripper`：关闭夹爪状态采集。
-- `--gripper-no-setup`：不自动开启 24V 和 Modbus 模式。
-- `--gripper-keep-power`：退出时不关闭末端 24V。
 
 ### `data_viwer.py`
 

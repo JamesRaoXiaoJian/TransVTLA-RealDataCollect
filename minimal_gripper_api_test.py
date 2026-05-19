@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Minimal RealMan gripper API test with detailed logging.
 
-Only uses the gripper control APIs:
-- rm_get_gripper_state
+Uses official gripper control APIs and RM Plus state readback:
+- rm_get_rm_plus_state_info
 - rm_set_gripper_position
 - rm_set_gripper_release
 - rm_set_gripper_pick
@@ -84,28 +84,28 @@ def connect(host: str, port: int) -> RoboticArm:
 def run_test(args: argparse.Namespace) -> None:
     arm = connect(args.host, args.port)
     try:
-        call_step("read initial gripper state", arm.rm_get_gripper_state)
+        call_step("read initial RM Plus gripper state", arm.rm_get_rm_plus_state_info)
 
         call_step(
             f"set gripper position {args.position}",
             lambda: arm.rm_set_gripper_position(args.position, args.block, args.timeout),
         )
         time.sleep(args.pause)
-        call_step("read state after position", arm.rm_get_gripper_state)
+        call_step("read RM Plus state after position", arm.rm_get_rm_plus_state_info)
 
         call_step(
             f"release gripper speed={args.speed}",
             lambda: arm.rm_set_gripper_release(args.speed, args.block, args.timeout),
         )
         time.sleep(args.pause)
-        call_step("read state after release", arm.rm_get_gripper_state)
+        call_step("read RM Plus state after release", arm.rm_get_rm_plus_state_info)
 
         call_step(
             f"pick gripper speed={args.speed}, force={args.force}",
             lambda: arm.rm_set_gripper_pick(args.speed, args.force, args.block, args.timeout),
         )
         time.sleep(args.pause)
-        call_step("read state after pick", arm.rm_get_gripper_state)
+        call_step("read RM Plus state after pick", arm.rm_get_rm_plus_state_info)
     finally:
         print("\n===== disconnect =====")
         start = time.perf_counter()

@@ -1,15 +1,17 @@
-"""Collect synchronized data from DJI, RealSense RGB, robotic arm state, and pressure UDP data.
+"""Collect synchronized data from DJI, RealSense RGB, robot, pressure, and gripper state.
 
 Sampling rates:
     - Visual (DJI + RealSense): 20Hz
     - Tactile/Pressure: 200Hz
     - Robot Arm State: 200Hz
+    - Gripper RM Plus State: 200Hz target
 
 Press SPACE to start/stop individual recording sessions. Each session creates a
 timestamped folder containing:
     - `dji/`             : DJI Osmo Action RGB frames (20Hz)
     - `realsense_rgb/`   : Intel RealSense RGB frames (20Hz)
     - `robot_state/`     : CSV robot arm state at 200Hz
+    - `robot_state/`     : CSV gripper state from RM Plus
     - `pressure/`        : CSV pressure samples at 200Hz
 
 Use Q or ESC to exit at any time.
@@ -31,11 +33,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from Robotic_Arm.rm_robot_interface import (
-    RoboticArm,
-    rm_peripheral_read_write_params_t,
-    rm_thread_mode_e,
-)
+from Robotic_Arm.rm_robot_interface import RoboticArm, rm_thread_mode_e
 
 try:
     import pyrealsense2 as rs
@@ -72,15 +70,6 @@ GRIPPER_FPS = 200
 GRIPPER_INTERVAL_S = 1.0 / GRIPPER_FPS
 GRIPPER_BATCH_SIZE = 100
 GRIPPER_FLUSH_INTERVAL_S = 0.1
-
-DEFAULT_GRIPPER_MODBUS_PORT = 1
-DEFAULT_GRIPPER_BAUDRATE = 115200
-DEFAULT_GRIPPER_MODBUS_TIMEOUT = 2
-DEFAULT_GRIPPER_DEVICE = 1
-GRIPPER_TOOL_VOLTAGE_24V = 3
-GRIPPER_REG_POSITION = 258
-GRIPPER_REG_RUN = 264
-GRIPPER_REG_MOMENT = 284
 
 
 class DJICamera:
@@ -488,11 +477,10 @@ class RobotArmCollector:
 
 
 class GripperStateCollector:
-    """Collect Zhixing gripper Modbus register state into robot_state/gripper_state.csv.
+    """Collect gripper state through RM Plus into robot_state/gripper_state.csv.
 
-    The target loop rate is 200Hz to align with the rest of the data schema, but
-    RealMan API Modbus reads are usually much slower. Each row records read
-    latency and deadline lateness so the real sampling rate is visible.
+    RM Plus returns real-time end-tool state. For this gripper, pos[0] is the
+    gripper opening value requested by the user.
     """
 
     def __init__(
@@ -500,35 +488,19 @@ class GripperStateCollector:
         host: str,
         port: int,
         interval_s: float = GRIPPER_INTERVAL_S,
-        modbus_port: int = DEFAULT_GRIPPER_MODBUS_PORT,
-        baudrate: int = DEFAULT_GRIPPER_BAUDRATE,
-        modbus_timeout: int = DEFAULT_GRIPPER_MODBUS_TIMEOUT,
-        device: int = DEFAULT_GRIPPER_DEVICE,
         batch_size: int = GRIPPER_BATCH_SIZE,
         flush_interval_s: float = GRIPPER_FLUSH_INTERVAL_S,
-        setup_bus: bool = True,
-        keep_power: bool = False,
-        keep_modbus: bool = False,
     ):
         self.host = host
         self.port = port
         self.interval_s = interval_s
-        self.modbus_port = modbus_port
-        self.baudrate = baudrate
-        self.modbus_timeout = modbus_timeout
-        self.device = device
         self.batch_size = batch_size
         self.flush_interval_s = flush_interval_s
-        self.setup_bus = setup_bus
-        self.keep_power = keep_power
-        self.keep_modbus = keep_modbus
 
         self.robot = RoboticArm(rm_thread_mode_e.RM_TRIPLE_MODE_E)
         self.handle = None
         self.thread: Optional[threading.Thread] = None
         self.running = False
-        self.modbus_open = False
-        self.power_on = False
 
         self.recording = False
         self.csv_file = None
@@ -537,9 +509,8 @@ class GripperStateCollector:
         self.last_flush_time = time.time()
 
         self.latest_state: dict = {
-            "position_code": -1,
-            "position_value": None,
-            "position_bytes": None,
+            "code": -1,
+            "gripper_pos": None,
             "latency_ms": None,
         }
         self.lock = threading.Lock()
@@ -547,29 +518,8 @@ class GripperStateCollector:
     def connect(self) -> None:
         self.handle = self.robot.rm_create_robot_arm(self.host, self.port)
         if self.handle is None or getattr(self.handle, "id", -1) < 0:
-            raise RuntimeError("Failed to create gripper Modbus robot arm handle.")
-        print(f"Gripper Modbus handle ID: {self.handle.id}")
-
-        if not self.setup_bus:
-            print("Gripper bus setup skipped.")
-            return
-
-        code = self.robot.rm_set_tool_voltage(GRIPPER_TOOL_VOLTAGE_24V)
-        print(f"Gripper set tool 24V: {code}")
-        if code != 0:
-            raise RuntimeError(f"Failed to enable gripper tool 24V, code={code}")
-        self.power_on = True
-        time.sleep(1.0)
-
-        code = self.robot.rm_set_modbus_mode(self.modbus_port, self.baudrate, self.modbus_timeout)
-        print(
-            "Gripper set Modbus RTU: "
-            f"port={self.modbus_port}, baudrate={self.baudrate}, timeout={self.modbus_timeout}, code={code}"
-        )
-        if code != 0:
-            raise RuntimeError(f"Failed to enable gripper Modbus RTU, code={code}")
-        self.modbus_open = True
-        time.sleep(1.0)
+            raise RuntimeError("Failed to create gripper RM Plus robot arm handle.")
+        print(f"Gripper RM Plus handle ID: {self.handle.id}")
 
     def start(self) -> None:
         self.running = True
@@ -583,12 +533,6 @@ class GripperStateCollector:
             self.thread.join(timeout=2.0)
             self.thread = None
         self.stop_session()
-        if self.modbus_open and not self.keep_modbus:
-            print(f"Gripper close Modbus RTU: {self.robot.rm_close_modbus_mode(self.modbus_port)}")
-            self.modbus_open = False
-        if self.power_on and not self.keep_power:
-            print(f"Gripper turn off tool 24V: {self.robot.rm_set_tool_voltage(0)}")
-            self.power_on = False
         if self.handle is not None:
             self.robot.rm_delete_robot_arm()
             self.handle = None
@@ -605,13 +549,15 @@ class GripperStateCollector:
             headers = [
                 "timestamp_us",
                 "target_hz",
-                "position_read_code",
-                "position_read_latency_ms",
-                "position_b0",
-                "position_b1",
-                "position_b2",
-                "position_b3",
-                "position_value",
+                "rm_plus_read_code",
+                "rm_plus_read_latency_ms",
+                "sys_state",
+                "gripper_pos",
+                "gripper_speed",
+                "gripper_current",
+                "gripper_force",
+                "gripper_dof_state",
+                "gripper_dof_err",
                 "deadline_late_ms",
             ]
             self.csv_writer.writerow(headers)
@@ -637,20 +583,11 @@ class GripperStateCollector:
         with self.lock:
             return dict(self.latest_state)
 
-    def _read_position_register(self) -> tuple[int, list[int]]:
-        read_params = rm_peripheral_read_write_params_t(
-            port=self.modbus_port,
-            address=GRIPPER_REG_POSITION,
-            device=self.device,
-            num=2,
-        )
-        return self.robot.rm_read_multiple_holding_registers(read_params)
-
     @staticmethod
-    def _decode_position(data: list[int]) -> Optional[int]:
-        if len(data) != 4:
-            return None
-        return (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3]
+    def _first(values: object) -> Optional[int]:
+        if isinstance(values, list) and values:
+            return values[0]
+        return None
 
     def _poll_loop(self) -> None:
         next_tick = time.perf_counter()
@@ -662,20 +599,26 @@ class GripperStateCollector:
             late_ms = max(0.0, (time.perf_counter() - next_tick) * 1000.0)
             read_start = time.perf_counter()
             try:
-                code, data = self._read_position_register()
+                code, data = self.robot.rm_get_rm_plus_state_info()
             except Exception:
-                code, data = -1, []
+                code, data = -1, {}
             read_latency_ms = (time.perf_counter() - read_start) * 1000.0
 
-            position_bytes = data if code == 0 and len(data) == 4 else []
-            position_value = self._decode_position(position_bytes) if position_bytes else None
+            payload = data if code == 0 and isinstance(data, dict) else {}
+            gripper_pos = self._first(payload.get("pos"))
+            gripper_speed = self._first(payload.get("speed"))
+            gripper_current = self._first(payload.get("current"))
+            gripper_force = self._first(payload.get("force"))
+            gripper_dof_state = self._first(payload.get("dof_state"))
+            gripper_dof_err = self._first(payload.get("dof_err"))
+            sys_state = payload.get("sys_state", "")
             timestamp_us = int(time.time() * 1e6)
 
             with self.lock:
                 self.latest_state = {
-                    "position_code": code,
-                    "position_value": position_value,
-                    "position_bytes": list(position_bytes) if position_bytes else None,
+                    "code": code,
+                    "gripper_pos": gripper_pos,
+                    "sys_state": sys_state,
                     "latency_ms": read_latency_ms,
                 }
 
@@ -685,11 +628,13 @@ class GripperStateCollector:
                         GRIPPER_FPS,
                         code,
                         read_latency_ms,
-                        position_bytes[0] if position_bytes else "",
-                        position_bytes[1] if position_bytes else "",
-                        position_bytes[2] if position_bytes else "",
-                        position_bytes[3] if position_bytes else "",
-                        position_value if position_value is not None else "",
+                        sys_state,
+                        gripper_pos if gripper_pos is not None else "",
+                        gripper_speed if gripper_speed is not None else "",
+                        gripper_current if gripper_current is not None else "",
+                        gripper_force if gripper_force is not None else "",
+                        gripper_dof_state if gripper_dof_state is not None else "",
+                        gripper_dof_err if gripper_dof_err is not None else "",
                         late_ms,
                     ]
                     self.row_buffer.append(row)
@@ -747,14 +692,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pressure-remote-ip", default=DEFAULT_PRESSURE_REMOTE_IP)
     parser.add_argument("--pressure-remote-port", type=int, default=DEFAULT_PRESSURE_REMOTE_PORT)
 
-    parser.add_argument("--disable-gripper", action="store_true", help="Disable Zhixing gripper Modbus state logging.")
-    parser.add_argument("--gripper-modbus-port", type=int, default=DEFAULT_GRIPPER_MODBUS_PORT)
-    parser.add_argument("--gripper-baudrate", type=int, default=DEFAULT_GRIPPER_BAUDRATE)
-    parser.add_argument("--gripper-modbus-timeout", type=int, default=DEFAULT_GRIPPER_MODBUS_TIMEOUT)
-    parser.add_argument("--gripper-device", type=int, default=DEFAULT_GRIPPER_DEVICE)
-    parser.add_argument("--gripper-no-setup", action="store_true", help="Do not enable 24V or Modbus mode for gripper.")
-    parser.add_argument("--gripper-keep-power", action="store_true", help="Do not turn off end-tool 24V on exit.")
-    parser.add_argument("--gripper-keep-modbus", action="store_true", help="Do not close Modbus mode on exit.")
+    parser.add_argument("--disable-gripper", action="store_true", help="Disable RM Plus gripper state logging.")
 
     return parser
 
@@ -938,13 +876,6 @@ def main() -> None:
         gripper = GripperStateCollector(
             host=args.arm_host,
             port=args.arm_port,
-            modbus_port=args.gripper_modbus_port,
-            baudrate=args.gripper_baudrate,
-            modbus_timeout=args.gripper_modbus_timeout,
-            device=args.gripper_device,
-            setup_bus=not args.gripper_no_setup,
-            keep_power=args.gripper_keep_power,
-            keep_modbus=args.gripper_keep_modbus,
         )
     pressure = PressureCollector(
         local_port=args.pressure_local_port,
@@ -961,9 +892,9 @@ def main() -> None:
     print("Starting robot arm collector at 200Hz...")
     robot.start()
     if gripper is not None:
-        print("Connecting gripper Modbus state collector...")
+        print("Connecting gripper RM Plus state collector...")
         gripper.connect()
-        print("Starting gripper Modbus state collector at target 200Hz...")
+        print("Starting gripper RM Plus state collector at target 200Hz...")
         gripper.start()
     print("Starting pressure collector at 200Hz...")
     pressure.start()
@@ -1027,8 +958,8 @@ def main() -> None:
             latest_pose_text = "Pose: " + (" | ".join(f"{val:.3f}" for val in pose) if pose else "N/A")
             if gripper is not None:
                 gripper_state = gripper.get_latest_state()
-                gripper_pos = gripper_state.get("position_value")
-                gripper_code = gripper_state.get("position_code")
+                gripper_pos = gripper_state.get("gripper_pos")
+                gripper_code = gripper_state.get("code")
                 gripper_latency = gripper_state.get("latency_ms")
                 if gripper_pos is None:
                     latest_gripper_text = f"Gripper: code={gripper_code} pos=N/A"
