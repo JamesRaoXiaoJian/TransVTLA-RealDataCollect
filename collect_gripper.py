@@ -41,15 +41,15 @@ except ImportError:  # pragma: no cover
     rs = None
 
 
-DEFAULT_DJI_INDEX = 1
-DEFAULT_ARM_HOST = "172.25.5.243"
+DEFAULT_DJI_INDEX = 0
+DEFAULT_ARM_HOST = "192.168.31.92"
 DEFAULT_ARM_PORT = 8080
 MAX_PREVIEW_WIDTH = 1920
 
 # Sampling rates (Hz)
 VISUAL_FPS = 20          # 视觉采样率 20Hz
 TACTILE_FPS = 200        # 触觉/压力采样率 200Hz
-ROBOT_ARM_FPS = 200      # 机械臂状态采样率 200Hz
+ROBOT_ARM_FPS = 100      # 机械臂状态采样率 200Hz
 
 VISUAL_INTERVAL_S = 1.0 / VISUAL_FPS      # 50ms
 ROBOT_ARM_INTERVAL_S = 1.0 / ROBOT_ARM_FPS  # 5ms
@@ -715,10 +715,10 @@ def draw_pressure_dashboard(canvas: np.ndarray, x: int, y: int, frame_w: int, va
     if not values or len(values) < 64:
         return
 
-    LEFT_CHANNEL = 19
-    RIGHT_CHANNEL = 18
-    LEFT_MATRIX_CHANNELS = [[1, 16, 15], [14, 13, 12], [11, 10, 9]]
-    RIGHT_MATRIX_CHANNELS = [[17, 32, 31], [30, 29, 28], [27, 26, 25]]
+    LEFT_CHANNEL = 51
+    RIGHT_CHANNEL = 50
+    LEFT_MATRIX_CHANNELS = [[63, 60, 57], [64, 61, 58], [49, 62, 59]]
+    RIGHT_MATRIX_CHANNELS = [[47, 44, 41], [48, 45, 42], [33, 46, 43]]
 
     def get_val(ch: int) -> int:
         return values[ch - 1] if 0 <= ch - 1 < len(values) else 0

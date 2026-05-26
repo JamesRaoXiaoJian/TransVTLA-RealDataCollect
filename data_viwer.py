@@ -15,10 +15,10 @@ import cv2
 import numpy as np
 
 # Pressure channel mapping
-LEFT_CHANNEL = 19
-RIGHT_CHANNEL = 18
-LEFT_MATRIX_CHANNELS = [[1, 16, 15], [14, 13, 12], [11, 10, 9]]
-RIGHT_MATRIX_CHANNELS = [[17, 32, 31], [30, 29, 28], [27, 26, 25]]
+LEFT_CHANNEL = 51
+RIGHT_CHANNEL = 50
+LEFT_MATRIX_CHANNELS = [[63, 60, 57], [64, 61, 58], [49, 62, 59]]
+RIGHT_MATRIX_CHANNELS = [[47, 44, 41], [48, 45, 42], [33, 46, 43]]
 
 
 # ─── Session discovery ───────────────────────────────────────────────────────

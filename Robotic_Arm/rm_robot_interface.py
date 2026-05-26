@@ -6573,7 +6573,6 @@ class RoboticArm(ArmState, MovePlan, JointConfigSettings, JointConfigReader, Arm
         if mode == None:
             return
         rm_init(mode)
-        print("current c api version: ", rm_api_version())
 
     def rm_create_robot_arm(self, ip: str, port: int, level: int = 3, log_func: CFUNCTYPE = None) -> rm_robot_handle:
         """
