@@ -1,14 +1,16 @@
-"""Offline viewer for synchronized DJI, RealSense, robot state, and pressure data.
+"""PySide6 session viewer with task/instruction annotations.
 
 Recursively search for session directories under the given base path.
-PySide6 GUI with a session list, frame slider, and composed view.
+Annotations are stored as JSON inside each session folder.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -21,6 +23,8 @@ LEFT_CHANNEL = 51
 RIGHT_CHANNEL = 50
 LEFT_MATRIX_CHANNELS = [[63, 60, 57], [64, 61, 58], [49, 62, 59]]
 RIGHT_MATRIX_CHANNELS = [[47, 44, 41], [48, 45, 42], [33, 46, 43]]
+
+ANNOTATION_FILE = "annotations.json"
 
 
 # --- Session discovery ---
@@ -39,7 +43,32 @@ def find_sessions(base: Path) -> List[Path]:
     return results
 
 
-# --- Helpers ---
+# --- Annotations ---
+
+
+def load_annotations(session_dir: Path) -> dict:
+    path = session_dir / ANNOTATION_FILE
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {}
+
+
+def save_annotations(session_dir: Path, task: str, instruction: str) -> None:
+    path = session_dir / ANNOTATION_FILE
+    payload = {
+        "task": task.strip(),
+        "instruction": instruction.strip(),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
 def common_frame_stems(dji_dir: Path, rs_dir: Path) -> List[str]:
@@ -167,7 +196,7 @@ def draw_pressure_dashboard(
     all_abs += [abs(v) for row in right_mat for v in row]
     peak = float(max(1, max(all_abs)))
 
-    # Left column: two horizontal bars stacked vertically, left-aligned
+    #  Left column: two horizontal bars stacked vertically, left-aligned 
     bar_h = 32
 
     for label, value, cy in [("Left", left_val, bar_centers[0]),
@@ -186,7 +215,7 @@ def draw_pressure_dashboard(
         draw_text_centered(canvas, f"{value:d}", bx + left_w // 2, by + bar_h // 2,
                    font_scale=0.7, color=text_c, thickness=1)
 
-    # Right area: two 3x3 matrices side by side + colorbar (no labels)
+    #  Right area: two 3x3 matrices side by side + colorbar (no labels) 
     mat_w = CELL_SIZE * 3 + CELL_GAP * 2
     mat_h = mat_w
     colorbar_w = 20
@@ -220,7 +249,7 @@ def draw_pressure_dashboard(
 # --- Canvas composition ---
 
 
-def compose_canvas(
+def compose_view_canvas(
     dji_img: np.ndarray,
     rs_img: np.ndarray,
     frame_label: str,
@@ -238,14 +267,14 @@ def compose_canvas(
     left = resize_to_height(dji_img, height)
     right = resize_to_height(rs_img, height)
 
-    gap = 14
+    gap = 6
     width = left.shape[1] + right.shape[1] + gap
     top = np.full((height, width, 3), BG_COLOR, dtype=np.uint8)
     top[:, :left.shape[1]] = left
     top[:, left.shape[1] + gap:] = right
 
     # Info panel: left 40% (info+bars), right 60% (matrices)
-    margin = 20
+    margin = 12
     state_lines = state_text.splitlines()
 
     mat_h = CELL_SIZE * 3 + CELL_GAP * 2
@@ -255,23 +284,23 @@ def compose_canvas(
     left_x = margin
     right_x = left_x + left_w
 
-    info_height = mat_h + 80
+    info_height = mat_h + 40
     info = np.full((info_height, width, 3), (245, 245, 245), dtype=np.uint8)
 
-    text_y = 32
+    text_y = 24
     cv2.putText(info, frame_label, (left_x, text_y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (20, 60, 140), 2, cv2.LINE_AA)
-    line_h = 34
+    line_h = 30
     for i, line in enumerate(state_lines):
         y_pos = text_y + line_h * (i + 1)
         cv2.putText(info, line, (left_x, y_pos),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (30, 30, 30), 1, cv2.LINE_AA)
 
     bar_h = 32
-    bar_gap = 16
+    bar_gap = 12
     bar_area_h = bar_h * 2 + bar_gap
     text_block_h = text_y + line_h * (len(state_lines) + 1)
-    bar_top = max(info_height - bar_area_h - 16, text_block_h + 18)
+    bar_top = max(info_height - bar_area_h - 8, text_block_h + 12)
     bar_positions = [bar_top + bar_h // 2, bar_top + bar_h + bar_gap + bar_h // 2]
     draw_pressure_dashboard(info, left_x, left_w, right_x, right_w, bar_positions, info_height, pressure_values)
 
@@ -335,9 +364,12 @@ class SessionData:
         self.robot_state_data = load_robot_state_csv(self.state_dir)
         self.pressure_data = load_pressure_csv(self.pressure_dir)
 
+        ann = load_annotations(self.session)
+        self.task = str(ann.get("task", ""))
+        self.instruction = str(ann.get("instruction", ""))
+
     def label(self) -> str:
-        rel = self.session.relative_to(self.base)
-        return str(rel)
+        return session_list_label(self.session, self.base)
 
     def _get_robot_state(self, frame_idx: int) -> tuple[Optional[list[float]], Optional[list[float]]]:
         if not self.robot_state_data:
@@ -369,13 +401,20 @@ class SessionData:
 
         session_label = self.session.parent.name + "/" + self.session.name
         header = f"[{session_index + 1}/{total_sessions}] {session_label}  |  Frame {stem}"
-        return compose_canvas(dji_img, rs_img, header, state_text, pressure_values)
+        return compose_view_canvas(dji_img, rs_img, header, state_text, pressure_values)
+
+
+def session_list_label(session: Path, base: Path) -> str:
+    rel = session.relative_to(base)
+    ann = load_annotations(session)
+    has_ann = bool(ann.get("task") or ann.get("instruction"))
+    return f"{rel}{' *' if has_ann else ''}"
 
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, sessions: List[Path], base: Path, start_index: int) -> None:
         super().__init__()
-        self.setWindowTitle("Session Viewer")
+        self.setWindowTitle("Session Annotator")
         self.resize(1400, 900)
 
         self.base = base
@@ -395,8 +434,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(root)
 
         main_layout = QtWidgets.QHBoxLayout(root)
-        main_layout.setContentsMargins(18, 18, 18, 18)
-        main_layout.setSpacing(16)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(12)
 
         self.session_list = QtWidgets.QListWidget()
         self.session_list.setMinimumWidth(320)
@@ -405,7 +444,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right)
-        right_layout.setSpacing(14)
+        right_layout.setSpacing(10)
 
         self.frame_label = QtWidgets.QLabel("No session selected")
         self.frame_label.setStyleSheet("font-weight: 600;")
@@ -419,6 +458,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.frame_slider.valueChanged.connect(self._on_frame_changed)
         right_layout.addWidget(self.frame_slider)
 
+        form = QtWidgets.QFormLayout()
+        self.task_input = QtWidgets.QLineEdit()
+        self.instruction_input = QtWidgets.QLineEdit()
+        form.addRow("Task", self.task_input)
+        form.addRow("Instruction", self.instruction_input)
+        right_layout.addLayout(form)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.save_btn = QtWidgets.QPushButton("Save")
+        self.save_btn.clicked.connect(self._save_annotations)
+        btn_row.addWidget(self.save_btn)
+        btn_row.addStretch(1)
+        right_layout.addLayout(btn_row)
+
         self.status_label = QtWidgets.QLabel("Press A to toggle session list")
         right_layout.addWidget(self.status_label)
 
@@ -427,7 +480,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _populate_sessions(self) -> None:
         self.session_list.clear()
         for s in self.sessions:
-            self.session_list.addItem(str(s.relative_to(self.base)))
+            self.session_list.addItem(session_list_label(s, self.base))
 
     def _on_session_selected(self, index: int) -> None:
         if index < 0 or index >= len(self.sessions):
@@ -439,6 +492,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self.current_index = index
+        self.task_input.setText(self.session_data.task)
+        self.instruction_input.setText(self.session_data.instruction)
         self.frame_slider.setRange(0, max(len(self.session_data.stems) - 1, 0))
         self.frame_slider.setValue(0)
         self._render_frame()
@@ -456,6 +511,17 @@ class MainWindow(QtWidgets.QMainWindow):
         canvas = self.session_data.frame_canvas(idx, self.current_index, len(self.sessions))
         self.image_label.set_image(canvas)
         self.frame_label.setText(f"Frame {idx + 1}/{len(self.session_data.stems)}")
+
+    def _save_annotations(self) -> None:
+        if not self.session_data:
+            return
+        self.session_data.task = self.task_input.text().strip()
+        self.session_data.instruction = self.instruction_input.text().strip()
+        save_annotations(self.session_data.session, self.session_data.task, self.session_data.instruction)
+        self.session_list.item(self.current_index).setText(self.session_data.label())
+        path = self.session_data.session / ANNOTATION_FILE
+        self.status_label.setText(f"Saved: {path}")
+        print(f"Saved annotations to {path}")
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         key = event.key()
@@ -489,7 +555,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Session data viewer")
+    parser = argparse.ArgumentParser(description="Session data viewer with annotations")
     parser.add_argument("--sessions", type=Path, default=Path("sessions"),
                         help="Base directory to recursively search for sessions")
     parser.add_argument("--session", type=str,
