@@ -40,7 +40,7 @@ sessions/
 | `collect_vision.py` | 是 | 否 | 否 | 否 |
 | `collect_robot.py` | 是 | 是 | 否 | 否 |
 | `collect_pressure.py` | 是 | 是 | 是 | 否 |
-| `collect_gripper.py` | 是 | 是 | 是 | 是 |
+| `collect_data.py` | 是 | 是 | 是 | 是 |
 
 ## 原始数据格式
 
@@ -71,7 +71,7 @@ CSV 格式，14 列：
 
 ### 3. 夹爪状态 — `robot_state/gripper_state.csv`
 
-该文件仅由 `collect_gripper.py` 生成，用于记录官方状态读取 API 返回的夹爪实时状态。
+该文件仅由 `collect_data.py` 生成，用于记录官方状态读取 API 返回的夹爪实时状态。
 
 CSV 格式，12 列：
 
