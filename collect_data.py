@@ -167,6 +167,10 @@ class PressureDashboard(QtWidgets.QWidget):
         self._values: list[int] = [0] * 64
         self._state_text = ""
         self.setMinimumHeight(260)
+        self.setAutoFillBackground(True)
+        pal = self.palette()
+        pal.setColor(QtGui.QPalette.Window, QtCore.Qt.white)
+        self.setPalette(pal)
 
     def set_values(self, values: list[int]) -> None:
         if len(values) >= 64:
