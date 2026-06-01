@@ -30,6 +30,7 @@ class RealSenseRGB:
         pipeline = rs.pipeline()
         config = rs.config()
         config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
+        config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
         try:
             pipeline.start(config)
         except RuntimeError as exc:
@@ -61,6 +62,23 @@ class RealSenseRGB:
                 self.last_warn_time = now
             return self._zero_frame()
 
+    def read_depth(self) -> np.ndarray:
+        if self.pipeline is None:
+            return self._zero_depth()
+
+        try:
+            frames = self.pipeline.wait_for_frames(timeout_ms=500)
+            depth_frame = frames.get_depth_frame()
+            if not depth_frame:
+                raise RuntimeError("Missing RealSense depth frame.")
+            return np.asanyarray(depth_frame.get_data())
+        except Exception as exc:
+            now = time.time()
+            if (now - self.last_warn_time) >= 1.0:
+                print(f"Warning: RealSense depth read failed. Using zero-filled frame. Details: {exc}")
+                self.last_warn_time = now
+            return self._zero_depth()
+
     def stop(self) -> None:
         if self.pipeline is not None:
             self.pipeline.stop()
@@ -69,3 +87,6 @@ class RealSenseRGB:
 
     def _zero_frame(self) -> np.ndarray:
         return np.zeros((self.height, self.width, 3), dtype=np.uint8)
+
+    def _zero_depth(self) -> np.ndarray:
+        return np.zeros((self.height, self.width), dtype=np.uint16)

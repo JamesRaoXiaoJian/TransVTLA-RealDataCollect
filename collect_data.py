@@ -10,6 +10,7 @@ Press SPACE to start/stop individual recording sessions. Each session creates a
 timestamped folder containing:
     - `dji/`             : DJI Osmo Action RGB frames (20Hz)
     - `realsense_rgb/`   : Intel RealSense RGB frames (20Hz)
+    - `realsense_depth/` : Intel RealSense depth frames (20Hz, 16-bit PNG)
     - `robot_state/`     : CSV robot arm state + gripper state
     - `pressure/`        : CSV pressure samples at 200Hz
 
@@ -26,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -49,8 +51,8 @@ VISUAL_INTERVAL_S = 1.0 / VISUAL_FPS
 
 LEFT_CHANNEL = 51
 RIGHT_CHANNEL = 50
-LEFT_MATRIX_CHANNELS = [[63, 60, 57], [64, 61, 58], [49, 62, 59]]
-RIGHT_MATRIX_CHANNELS = [[47, 44, 41], [48, 45, 42], [33, 46, 43]]
+LEFT_MATRIX_CHANNELS = [[47, 44, 41], [48, 45, 42], [33, 46, 43]]
+RIGHT_MATRIX_CHANNELS = [[63, 60, 57], [64, 61, 61], [49, 62, 59]]
 
 
 @dataclass
@@ -58,6 +60,7 @@ class SessionPaths:
     root: Path
     dji: Path
     realsense: Path
+    realsense_depth: Path
     pressure: Path
 
 
@@ -90,13 +93,14 @@ def create_session_paths(base: Path, prefix: str) -> SessionPaths:
     session_root = base / f"{prefix}_{timestamp}"
     dji_dir = session_root / "dji"
     rs_dir = session_root / "realsense_rgb"
+    rs_depth_dir = session_root / "realsense_depth"
     pressure_dir = session_root / "pressure"
 
-    for directory in (dji_dir, rs_dir, pressure_dir):
+    for directory in (dji_dir, rs_dir, rs_depth_dir, pressure_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
     print(f"Recording session created: {session_root}")
-    return SessionPaths(root=session_root, dji=dji_dir, realsense=rs_dir, pressure=pressure_dir)
+    return SessionPaths(root=session_root, dji=dji_dir, realsense=rs_dir, realsense_depth=rs_depth_dir, pressure=pressure_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -220,14 +224,14 @@ class PressureDashboard(QtWidgets.QWidget):
         text_y = matrix_y
         bar_top = matrix_y + text_block_h + gap_text_bars
 
-        p.setPen(QtGui.QColor(220, 220, 220))
+        p.setPen(QtCore.Qt.black)
         for i, line in enumerate(state_lines):
             p.drawText(10, text_y + fm.ascent() + i * line_h, line)
 
         def draw_bar(bx: int, by: int, max_w: int, label: str, value: int) -> None:
             label_rect = fm.boundingRect(label)
             baseline_y = by + (bar_h + label_rect.height()) // 2
-            p.setPen(QtCore.Qt.white)
+            p.setPen(QtCore.Qt.black)
             p.drawText(bx + 10, baseline_y, label)
 
             b_left = bx + 10 + label_rect.width() + 15
@@ -244,7 +248,7 @@ class PressureDashboard(QtWidgets.QWidget):
 
             val_text = f"{value:d}"
             val_rect = fm.boundingRect(val_text)
-            p.setPen(QtCore.Qt.white)
+            p.setPen(QtCore.Qt.black)
             p.drawText(
                 b_left + (b_w - val_rect.width()) // 2,
                 by + (bar_h + val_rect.height()) // 2,
@@ -269,7 +273,7 @@ class PressureDashboard(QtWidgets.QWidget):
 
                     val_text = str(val)
                     val_rect = fm.boundingRect(val_text)
-                    p.setPen(QtCore.Qt.white)
+                    p.setPen(QtCore.Qt.black)
                     p.drawText(
                         cx + (mat_inner - val_rect.width()) // 2,
                         cy + (mat_inner + val_rect.height()) // 2,
@@ -339,7 +343,7 @@ class MainWindow(QtWidgets.QMainWindow):
         font = self.status_label.font()
         font.setPointSize(11)
         self.status_label.setFont(font)
-        self.status_label.setStyleSheet("color: #00ffff;")
+        self.status_label.setStyleSheet("color: #000000;")
         layout.addWidget(self.status_label)
 
         # Pressure dashboard (includes state text + bars + matrices)
@@ -434,8 +438,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.recording and self.session_paths is not None:
             self.frame_id += 1
             image_name = f"{self.frame_id:04d}.jpg"
+            depth_name = f"{self.frame_id:04d}.png"
             _bgr_to_qimage(dji_frame).save(str(self.session_paths.dji / image_name))
             _bgr_to_qimage(rs_frame).save(str(self.session_paths.realsense / image_name))
+            depth_frame = self.rs_camera.read_depth()
+            cv2.imwrite(str(self.session_paths.realsense_depth / depth_name), depth_frame)
 
     # ---- Keyboard ----
 
