@@ -300,6 +300,10 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.args = args
         self.setWindowTitle("Data Collector")
+        self.setAutoFillBackground(True)
+        pal = self.palette()
+        pal.setColor(QtGui.QPalette.Window, QtCore.Qt.white)
+        self.setPalette(pal)
 
         self.dji = DJICamera(index=args.dji_index, width=args.width, height=args.height)
         self.rs_camera = RealSenseRGB(width=args.width, height=args.height, fps=args.rs_fps)
@@ -328,6 +332,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_ui(self) -> None:
         root = QtWidgets.QWidget()
+        root.setAutoFillBackground(True)
+        pal = root.palette()
+        pal.setColor(QtGui.QPalette.Window, QtCore.Qt.white)
+        root.setPalette(pal)
         self.setCentralWidget(root)
         layout = QtWidgets.QVBoxLayout(root)
         layout.setContentsMargins(8, 8, 8, 8)
