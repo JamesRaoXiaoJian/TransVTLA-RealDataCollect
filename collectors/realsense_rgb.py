@@ -17,8 +17,14 @@ class RealSenseRGB:
         self.height = height
         self.fps = fps
         self.pipeline: Optional[object] = None
+        self.align: Optional[object] = None
+        self.spatial_filter: Optional[object] = None
+        self.temporal_filter: Optional[object] = None
+        self.hole_filling_filter: Optional[object] = None
         self.available = False
         self.last_warn_time = 0.0
+        self._last_color: Optional[np.ndarray] = None
+        self._last_depth: Optional[np.ndarray] = None
 
     def start(self) -> None:
         if rs is None:
@@ -43,18 +49,34 @@ class RealSenseRGB:
             )
             return
         self.pipeline = pipeline
+        self.align = rs.align(rs.stream.color)
+        self.spatial_filter = rs.spatial_filter()
+        self.temporal_filter = rs.temporal_filter()
+        self.hole_filling_filter = rs.hole_filling_filter()
         self.available = True
+
+    def _grab_frames(self) -> None:
+        """Grab one aligned frame pair, apply post-processing, cache results."""
+        if self.pipeline is None:
+            return
+        frames = self.pipeline.wait_for_frames(timeout_ms=500)
+        aligned_frames = self.align.process(frames)
+        color_frame = aligned_frames.get_color_frame()
+        depth_frame = aligned_frames.get_depth_frame()
+        if not color_frame or not depth_frame:
+            raise RuntimeError("Missing RealSense frame.")
+        depth_frame = self.spatial_filter.process(depth_frame)
+        depth_frame = self.temporal_filter.process(depth_frame)
+        depth_frame = self.hole_filling_filter.process(depth_frame)
+        self._last_color = np.asanyarray(color_frame.get_data())
+        self._last_depth = np.asanyarray(depth_frame.get_data())
 
     def read(self) -> np.ndarray:
         if self.pipeline is None:
             return self._zero_frame()
-
         try:
-            frames = self.pipeline.wait_for_frames(timeout_ms=500)
-            color_frame = frames.get_color_frame()
-            if not color_frame:
-                raise RuntimeError("Missing RealSense color frame.")
-            return np.asanyarray(color_frame.get_data())
+            self._grab_frames()
+            return self._last_color
         except Exception as exc:
             now = time.time()
             if (now - self.last_warn_time) >= 1.0:
@@ -63,26 +85,20 @@ class RealSenseRGB:
             return self._zero_frame()
 
     def read_depth(self) -> np.ndarray:
-        if self.pipeline is None:
-            return self._zero_depth()
-
-        try:
-            frames = self.pipeline.wait_for_frames(timeout_ms=500)
-            depth_frame = frames.get_depth_frame()
-            if not depth_frame:
-                raise RuntimeError("Missing RealSense depth frame.")
-            return np.asanyarray(depth_frame.get_data())
-        except Exception as exc:
-            now = time.time()
-            if (now - self.last_warn_time) >= 1.0:
-                print(f"Warning: RealSense depth read failed. Using zero-filled frame. Details: {exc}")
-                self.last_warn_time = now
-            return self._zero_depth()
+        if self._last_depth is not None:
+            return self._last_depth
+        return self._zero_depth()
 
     def stop(self) -> None:
         if self.pipeline is not None:
             self.pipeline.stop()
             self.pipeline = None
+        self.align = None
+        self.spatial_filter = None
+        self.temporal_filter = None
+        self.hole_filling_filter = None
+        self._last_color = None
+        self._last_depth = None
         self.available = False
 
     def _zero_frame(self) -> np.ndarray:
