@@ -29,7 +29,7 @@ import pandas as pd
 from channel_config import (
     LEFT_CHANNEL, RIGHT_CHANNEL,
     LEFT_MATRIX_CHANNELS, RIGHT_MATRIX_CHANNELS,
-    VALID_CHANNELS,
+    VALID_CHANNELS, INTERPOLATE_CHANNELS,
 )
 
 LEFT_TOTAL_CH = LEFT_CHANNEL
@@ -69,8 +69,27 @@ def extract_valid_channels(df: pd.DataFrame) -> np.ndarray:
     列索引对应关系：
         CH1 -> col 0, CH2 -> col 1, ..., CH64 -> col 63
     有效通道按 VALID_COL_INDICES 选取。
+
+    对于 INTERPOLATE_CHANNELS 中标记的异常通道，使用相邻通道均值替代。
     """
-    return df.values[:, VALID_COL_INDICES].astype(np.float64)
+    data = df.values[:, VALID_COL_INDICES].astype(np.float64)
+
+    # 处理需要插值的异常通道
+    if INTERPOLATE_CHANNELS:
+        for bad_ch, adjacent_chs in INTERPOLATE_CHANNELS.items():
+            if bad_ch not in VALID_CHANNELS:
+                continue
+            bad_idx = VALID_CHANNELS.index(bad_ch)
+            # 找到相邻通道在 VALID_CHANNELS 中的索引
+            adj_indices = []
+            for adj_ch in adjacent_chs:
+                if adj_ch in VALID_CHANNELS:
+                    adj_indices.append(VALID_CHANNELS.index(adj_ch))
+            if adj_indices:
+                # 用相邻通道均值替代
+                data[:, bad_idx] = data[:, adj_indices].mean(axis=1)
+
+    return data
 
 
 def baseline_subtract(data: np.ndarray, baseline_rows: int = BASELINE_ROWS) -> np.ndarray:

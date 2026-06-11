@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from typing import Optional
 
@@ -12,19 +13,39 @@ except ImportError:  # pragma: no cover
 
 
 class RealSenseRGB:
-    def __init__(self, width: int, height: int, fps: int):
+    """RealSense 相机采集器（后台线程版本）。
+
+    优化点：
+    - 后台线程持续采集，read() 非阻塞
+    - 深度滤波可选（默认关闭，离线处理）
+    - 关闭自动曝光，保证训练数据一致性
+    - 默认 848x480@30fps
+    """
+
+    def __init__(
+        self,
+        width: int = 848,
+        height: int = 480,
+        fps: int = 30,
+        enable_depth: bool = True,
+        enable_filters: bool = False,
+    ):
         self.width = width
         self.height = height
         self.fps = fps
+        self.enable_depth = enable_depth
+        self.enable_filters = enable_filters
+
         self.pipeline: Optional[object] = None
         self.align: Optional[object] = None
-        self.spatial_filter: Optional[object] = None
-        self.temporal_filter: Optional[object] = None
-        self.hole_filling_filter: Optional[object] = None
         self.available = False
         self.last_warn_time = 0.0
+
         self._last_color: Optional[np.ndarray] = None
         self._last_depth: Optional[np.ndarray] = None
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
 
     def start(self) -> None:
         if rs is None:
@@ -35,10 +56,20 @@ class RealSenseRGB:
 
         pipeline = rs.pipeline()
         config = rs.config()
-        config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
-        config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
+
+        # 配置 color 流
+        config.enable_stream(
+            rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps
+        )
+
+        # 配置 depth 流（可选）
+        if self.enable_depth:
+            config.enable_stream(
+                rs.stream.depth, self.width, self.height, rs.format.z16, self.fps
+            )
+
         try:
-            pipeline.start(config)
+            pipeline_profile = pipeline.start(config)
         except RuntimeError as exc:
             self.pipeline = None
             self.available = False
@@ -48,55 +79,101 @@ class RealSenseRGB:
                 f"{exc}"
             )
             return
+
+        # 调整传感器设置
+        device = pipeline_profile.get_device()
+
+        # 关闭自动曝光（训练数据一致性）
+        try:
+            depth_sensor = device.first_depth_sensor()
+            if depth_sensor.supports(rs.option.enable_auto_exposure):
+                depth_sensor.set_option(rs.option.enable_auto_exposure, 0)
+        except Exception:
+            pass
+
+        try:
+            color_sensor = device.first_color_sensor()
+            if color_sensor.supports(rs.option.enable_auto_exposure):
+                color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+            if color_sensor.supports(rs.option.enable_auto_white_balance):
+                color_sensor.set_option(rs.option.enable_auto_white_balance, 0)
+            # 手动曝光（根据环境光调整）
+            if color_sensor.supports(rs.option.exposure):
+                color_sensor.set_option(rs.option.exposure, 8.0)  # 8ms
+        except Exception:
+            pass
+
         self.pipeline = pipeline
-        self.align = rs.align(rs.stream.color)
-        self.spatial_filter = rs.spatial_filter()
-        self.temporal_filter = rs.temporal_filter()
-        self.hole_filling_filter = rs.hole_filling_filter()
+        if self.enable_depth:
+            self.align = rs.align(rs.stream.color)
+
+        # 启动后台采集线程
+        self._running = True
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
         self.available = True
 
-    def _grab_frames(self) -> None:
-        """Grab one aligned frame pair, apply post-processing, cache results."""
-        if self.pipeline is None:
-            return
-        frames = self.pipeline.wait_for_frames(timeout_ms=500)
-        aligned_frames = self.align.process(frames)
-        color_frame = aligned_frames.get_color_frame()
-        depth_frame = aligned_frames.get_depth_frame()
-        if not color_frame or not depth_frame:
-            raise RuntimeError("Missing RealSense frame.")
-        depth_frame = self.spatial_filter.process(depth_frame)
-        depth_frame = self.temporal_filter.process(depth_frame)
-        depth_frame = self.hole_filling_filter.process(depth_frame)
-        self._last_color = np.asanyarray(color_frame.get_data())
-        self._last_depth = np.asanyarray(depth_frame.get_data())
+        print(f"RealSense: {self.width}x{self.height} @{self.fps}fps, depth={self.enable_depth}")
+
+    def _capture_loop(self) -> None:
+        """后台线程：持续采集帧，缓存最新帧。"""
+        while self._running:
+            if self.pipeline is None:
+                break
+            try:
+                frames = self.pipeline.wait_for_frames(timeout_ms=1000)
+
+                if self.align:
+                    frames = self.align.process(frames)
+
+                color_frame = frames.get_color_frame()
+                if not color_frame:
+                    continue
+
+                color_data = np.asanyarray(color_frame.get_data())
+
+                depth_data = None
+                if self.enable_depth:
+                    depth_frame = frames.get_depth_frame()
+                    if depth_frame:
+                        # 深度滤波可选（默认关闭，离线处理）
+                        if self.enable_filters:
+                            depth_frame = rs.spatial_filter().process(depth_frame)
+                            depth_frame = rs.temporal_filter().process(depth_frame)
+                            depth_frame = rs.hole_filling_filter().process(depth_frame)
+                        depth_data = np.asanyarray(depth_frame.get_data())
+
+                with self._lock:
+                    self._last_color = color_data
+                    self._last_depth = depth_data
+
+            except Exception as e:
+                if self._running:
+                    time.sleep(0.01)
 
     def read(self) -> np.ndarray:
-        if self.pipeline is None:
-            return self._zero_frame()
-        try:
-            self._grab_frames()
-            return self._last_color
-        except Exception as exc:
-            now = time.time()
-            if (now - self.last_warn_time) >= 1.0:
-                print(f"Warning: RealSense frame read failed. Using zero-filled frame. Details: {exc}")
-                self.last_warn_time = now
-            return self._zero_frame()
+        """非阻塞读取最新帧。"""
+        with self._lock:
+            if self._last_color is not None:
+                return self._last_color.copy()
+        return self._zero_frame()
 
     def read_depth(self) -> np.ndarray:
-        if self._last_depth is not None:
-            return self._last_depth
+        """非阻塞读取最新深度帧。"""
+        with self._lock:
+            if self._last_depth is not None:
+                return self._last_depth.copy()
         return self._zero_depth()
 
     def stop(self) -> None:
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
         if self.pipeline is not None:
             self.pipeline.stop()
             self.pipeline = None
         self.align = None
-        self.spatial_filter = None
-        self.temporal_filter = None
-        self.hole_filling_filter = None
         self._last_color = None
         self._last_depth = None
         self.available = False

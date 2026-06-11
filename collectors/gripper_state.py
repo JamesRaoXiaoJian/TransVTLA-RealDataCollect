@@ -9,9 +9,10 @@ from typing import Optional
 from Robotic_Arm.rm_robot_interface import RoboticArm, rm_thread_mode_e
 
 from collectors.robot_arm import DEFAULT_ARM_HOST, DEFAULT_ARM_PORT
+from timestamp_utils import get_timestamp_us
 
-GRIPPER_FPS = 200
-GRIPPER_INTERVAL_S = 1.0 / GRIPPER_FPS
+GRIPPER_FPS = 200  # 目标频率，实际取决于 SDK 调用耗时
+GRIPPER_INTERVAL_S = 0.0  # 不额外 sleep，让 SDK 调用耗时决定节奏
 GRIPPER_BATCH_SIZE = 100
 GRIPPER_FLUSH_INTERVAL_S = 0.1
 
@@ -130,13 +131,14 @@ class GripperStateCollector:
         return None
 
     def _poll_loop(self) -> None:
-        next_tick = time.perf_counter()
+        """轮询夹爪状态。添加时间戳去重（当前 110/306 session 有重复，占 ~60%）。"""
+        last_timestamp_us = 0  # 去重：跳过相同时间戳
+
         while self.running:
             if self.handle is None:
                 time.sleep(0.1)
                 continue
 
-            late_ms = max(0.0, (time.perf_counter() - next_tick) * 1000.0)
             read_start = time.perf_counter()
             try:
                 code, data = self.robot.rm_get_rm_plus_state_info()
@@ -152,7 +154,14 @@ class GripperStateCollector:
             gripper_dof_state = self._first(payload.get("dof_state"))
             gripper_dof_err = self._first(payload.get("dof_err"))
             sys_state = payload.get("sys_state", "")
-            timestamp_us = int(time.time() * 1e6)
+
+            # 使用高精度单调时间戳
+            timestamp_us = get_timestamp_us()
+
+            # 去重：跳过相同时间戳
+            if timestamp_us == last_timestamp_us:
+                continue
+            last_timestamp_us = timestamp_us
 
             with self.lock:
                 self.latest_state = {
@@ -175,15 +184,12 @@ class GripperStateCollector:
                         gripper_force if gripper_force is not None else "",
                         gripper_dof_state if gripper_dof_state is not None else "",
                         gripper_dof_err if gripper_dof_err is not None else "",
-                        late_ms,
+                        0.0,  # late_ms 不再适用
                     ]
                     self.row_buffer.append(row)
                     self._flush_locked(force=False)
 
-            next_tick += self.interval_s
-            sleep_s = next_tick - time.perf_counter()
-            if sleep_s > 0:
-                time.sleep(sleep_s)
+            # 不 sleep，让 SDK 调用耗时决定节奏
 
     def _flush_locked(self, force: bool) -> None:
         if not self.recording or self.csv_writer is None or self.csv_file is None:

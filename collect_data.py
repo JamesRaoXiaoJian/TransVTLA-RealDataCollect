@@ -20,6 +20,7 @@ Use Q or ESC to exit at any time.
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 import time
 from dataclasses import dataclass
@@ -30,6 +31,8 @@ from typing import Optional
 import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
+
+from timestamp_utils import get_timestamp_us
 
 from collectors import (
     DJICamera,
@@ -307,7 +310,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setPalette(pal)
 
         self.dji = DJICamera(index=args.dji_index, width=args.width, height=args.height)
-        self.rs_camera = RealSenseRGB(width=args.width, height=args.height, fps=args.rs_fps)
+        # RealSense 使用优化配置：后台线程 + 关闭实时深度滤波
+        self.rs_camera = RealSenseRGB(
+            width=848, height=480, fps=args.rs_fps,
+            enable_depth=True, enable_filters=False,
+        )
         self.robot = RobotArmCollector(host=args.arm_host, port=args.arm_port)
         self.gripper: GripperStateCollector | None = None
         if not args.disable_gripper:
@@ -321,6 +328,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recording = False
         self.session_paths: SessionPaths | None = None
         self.frame_id = 0
+        self.frames_file = None
+        self.frames_writer = None
 
         self._build_ui()
         self._start_collectors()
@@ -399,15 +408,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.robot.start_session(self.session_paths.root)
         if self.gripper is not None:
             self.gripper.start_session(self.session_paths.root)
+
+        # 创建 frames.csv（帧元数据）
+        frames_path = self.session_paths.root / "frames.csv"
+        self.frames_file = open(frames_path, "w", newline="", encoding="utf-8")
+        self.frames_writer = csv.writer(self.frames_file)
+        self.frames_writer.writerow([
+            "frame_id", "capture_monotonic_us",
+            "dji_save_us", "realsense_save_us", "depth_save_us",
+        ])
+
         self.frame_id = 0
         self.recording = True
-        print("Recording started.")
+        print(f"Recording started. Session: {self.session_paths.root.name}")
 
     def _stop_recording(self) -> None:
         self.pressure.stop_session()
         self.robot.stop_session()
         if self.gripper is not None:
             self.gripper.stop_session()
+
+        # 关闭 frames.csv
+        if hasattr(self, 'frames_file') and self.frames_file is not None:
+            self.frames_file.close()
+            self.frames_file = None
+            self.frames_writer = None
+
         self.session_paths = None
         self.frame_id = 0
         self.recording = False
@@ -452,10 +478,32 @@ class MainWindow(QtWidgets.QMainWindow):
             self.frame_id += 1
             image_name = f"{self.frame_id:04d}.jpg"
             depth_name = f"{self.frame_id:04d}.png"
-            _bgr_to_qimage(dji_frame).save(str(self.session_paths.dji / image_name))
-            _bgr_to_qimage(rs_frame).save(str(self.session_paths.realsense / image_name))
+
+            # 使用 cv2.imwrite 保存 JPEG (Q85)，替代 QImage.save（更快）
+            capture_us = get_timestamp_us()
+            cv2.imwrite(
+                str(self.session_paths.dji / image_name), dji_frame,
+                [cv2.IMWRITE_JPEG_QUALITY, 85],
+            )
+            dji_save_us = get_timestamp_us()
+
+            cv2.imwrite(
+                str(self.session_paths.realsense / image_name), rs_frame,
+                [cv2.IMWRITE_JPEG_QUALITY, 85],
+            )
+            rs_save_us = get_timestamp_us()
+
             depth_frame = self.rs_camera.read_depth()
             cv2.imwrite(str(self.session_paths.realsense_depth / depth_name), depth_frame)
+            depth_save_us = get_timestamp_us()
+
+            # 记录帧元数据
+            if self.frames_writer is not None:
+                self.frames_writer.writerow([
+                    self.frame_id, capture_us, dji_save_us, rs_save_us, depth_save_us,
+                ])
+                if self.frame_id % 10 == 0:
+                    self.frames_file.flush()
 
     # ---- Keyboard ----
 

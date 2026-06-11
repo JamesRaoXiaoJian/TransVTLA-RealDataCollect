@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from timestamp_utils import get_timestamp_us
+
 TACTILE_FPS = 200
 
 DEFAULT_PRESSURE_LOCAL_PORT = 4321
@@ -88,7 +90,8 @@ class PressureCollector:
             self._stop_session_locked()
             self.csv_file = open(csv_path, "w", newline="", encoding="utf-8")
             self.csv_writer = csv.writer(self.csv_file)
-            headers = ["timestamp_us"] + [f"CH{i+1}" for i in range(64)]
+            # 双时间戳：sensor_timestamp_us（传感器时钟）+ host_monotonic_us（主机单调时钟）
+            headers = ["sensor_timestamp_us", "host_monotonic_us"] + [f"CH{i+1}" for i in range(64)]
             self.csv_writer.writerow(headers)
             self.row_buffer = []
             self.last_flush_time = time.time()
@@ -130,15 +133,18 @@ class PressureCollector:
                 print(f"[Pressure {addr}] Packet too small: {len(data)} bytes")
                 continue
 
-            timestamp_us, *values = struct.unpack(PRESSURE_PACKET_FORMAT, data)
+            sensor_timestamp_us, *values = struct.unpack(PRESSURE_PACKET_FORMAT, data)
 
-            now = time.time()
+            # 记录主机单调时间戳（用于时钟域对齐）
+            host_monotonic_us = get_timestamp_us()
+
             with self.lock:
-                self.latest_timestamp_us = timestamp_us
+                self.latest_timestamp_us = sensor_timestamp_us
                 self.latest_values = list(values)
 
                 if self.recording and self.csv_writer is not None:
-                    row = [timestamp_us] + self.latest_values
+                    # 双时间戳：传感器时钟 + 主机单调时钟
+                    row = [sensor_timestamp_us, host_monotonic_us] + self.latest_values
                     self.row_buffer.append(row)
                     self._flush_locked(force=False)
 
