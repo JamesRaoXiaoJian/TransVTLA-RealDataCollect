@@ -41,6 +41,7 @@ session419/
 sessions414/
 sample_output/
 backup_*/
+dataset/
 
 # Common output files
 *.csv
