@@ -4,11 +4,11 @@ from pathlib import Path
 import csv
 import statistics
 
-# Channel Mapping
-LEFT_CHANNEL = 51
-RIGHT_CHANNEL = 50
-LEFT_MATRIX_CHANNELS = [[63, 60, 57], [64, 61, 58], [49, 62, 59]]
-RIGHT_MATRIX_CHANNELS = [[47, 44, 41], [48, 45, 42], [33, 46, 43]]
+# Channel Mapping (from Channel Mapping.txt)
+from channel_config import (
+    LEFT_CHANNEL, RIGHT_CHANNEL,
+    LEFT_MATRIX_CHANNELS, RIGHT_MATRIX_CHANNELS,
+)
 
 
 def load_pressure_csv(pressure_dir: Path) -> list[list[int]]:

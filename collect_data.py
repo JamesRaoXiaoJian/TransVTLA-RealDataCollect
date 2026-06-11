@@ -49,10 +49,11 @@ from collectors.robot_arm import DEFAULT_ARM_HOST, DEFAULT_ARM_PORT
 VISUAL_FPS = 20
 VISUAL_INTERVAL_S = 1.0 / VISUAL_FPS
 
-LEFT_CHANNEL = 51
-RIGHT_CHANNEL = 50
-LEFT_MATRIX_CHANNELS = [[47, 44, 41], [48, 45, 42], [33, 46, 43]]
-RIGHT_MATRIX_CHANNELS = [[63, 60, 57], [64, 61, 61], [49, 62, 59]]
+# Pressure channel mapping (from Channel Mapping.txt)
+from channel_config import (
+    LEFT_CHANNEL, RIGHT_CHANNEL,
+    LEFT_MATRIX_CHANNELS, RIGHT_MATRIX_CHANNELS,
+)
 
 
 @dataclass

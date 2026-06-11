@@ -16,11 +16,11 @@ from typing import List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-# Pressure channel mapping
-LEFT_CHANNEL = 51
-RIGHT_CHANNEL = 50
-LEFT_MATRIX_CHANNELS = [[63, 60, 57], [64, 61, 58], [49, 62, 59]]
-RIGHT_MATRIX_CHANNELS = [[47, 44, 41], [48, 45, 42], [33, 46, 43]]
+# Pressure channel mapping (from Channel Mapping.txt)
+from channel_config import (
+    LEFT_CHANNEL, RIGHT_CHANNEL,
+    LEFT_MATRIX_CHANNELS, RIGHT_MATRIX_CHANNELS,
+)
 
 ANNOTATION_FILE = "annotations.json"
 

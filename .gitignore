@@ -44,6 +44,7 @@ sample_output/
 # Common output files
 *.csv
 *.json
+!channel_mapping.json
 *.png
 *.jpg
 *.jpeg

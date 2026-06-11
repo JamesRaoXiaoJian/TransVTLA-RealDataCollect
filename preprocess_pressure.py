@@ -23,29 +23,17 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# 通道定义（1-indexed，与硬件协议一致）
+# 通道定义（从 Channel Mapping.txt 统一读取）
 # 最终输出维度顺序：左总压(1) + 右总压(1) + 左矩阵(9) + 右矩阵(9) = 20
 # ============================================================
-LEFT_TOTAL_CH = 19
-RIGHT_TOTAL_CH = 18
-
-LEFT_MATRIX_CHANNELS: list[list[int]] = [
-    [1, 16, 15],
-    [14, 13, 12],
-    [11, 10, 9],
-]
-RIGHT_MATRIX_CHANNELS: list[list[int]] = [
-    [17, 32, 31],
-    [30, 29, 28],
-    [27, 26, 25],
-]
-
-# 按固定顺序排列的 20 个有效通道（1-indexed）
-VALID_CHANNELS: list[int] = (
-    [LEFT_TOTAL_CH, RIGHT_TOTAL_CH]
-    + [ch for row in LEFT_MATRIX_CHANNELS for ch in row]
-    + [ch for row in RIGHT_MATRIX_CHANNELS for ch in row]
+from channel_config import (
+    LEFT_CHANNEL, RIGHT_CHANNEL,
+    LEFT_MATRIX_CHANNELS, RIGHT_MATRIX_CHANNELS,
+    VALID_CHANNELS,
 )
+
+LEFT_TOTAL_CH = LEFT_CHANNEL
+RIGHT_TOTAL_CH = RIGHT_CHANNEL
 
 # CSV 中的列名格式为 CH1, CH2, ..., CH64
 # pandas 读入后列索引从 0 开始，通道号需减 1 映射到列索引
