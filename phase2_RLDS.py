@@ -6,6 +6,7 @@ import sys
 import cv2
 from pathlib import Path
 from typing import Iterator, Dict, Any, Tuple
+from session_schema import common_frame_stems, resolve_session_layout, rgb_path
 
 # [核心修复] 强制该脚本仅使用 CPU，避免卡在 GPU 驱动注册环节
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -37,7 +38,7 @@ class LocalRobotData(tfds.core.GeneratorBasedBuilder):
                 'steps': tfds.features.Dataset({
                     'observation': tfds.features.FeaturesDict({
                         'primary_image': tfds.features.Image(
-                            shape=(224, 224, 3), dtype=np.uint8, doc='DJI Action 主视角'
+                            shape=(224, 224, 3), dtype=np.uint8, doc='World RealSense 主视角'
                         ),
                         'wrist_image': tfds.features.Image(
                             shape=(224, 224, 3), dtype=np.uint8, doc='RealSense 腕部视角'
@@ -83,8 +84,11 @@ class LocalRobotData(tfds.core.GeneratorBasedBuilder):
             print(f"  > [{ep_idx+1}/{total_sessions}] 正在处理: {session_dir.name} ...", end='\r')
             
             robot_state_dir = session_dir / "robot_state"
-            dji_dir = session_dir / "dji"
-            rs_dir = session_dir / "realsense_rgb"
+            try:
+                layout = resolve_session_layout(session_dir)
+            except FileNotFoundError:
+                continue
+            stems = set(common_frame_stems(layout))
 
             state_files = sorted(list(robot_state_dir.glob("*.json")))
             if not state_files: continue
@@ -96,8 +100,10 @@ class LocalRobotData(tfds.core.GeneratorBasedBuilder):
                         data = json.load(f)
                     
                     frame_id = data.get("frame", "")
-                    d_img_path = dji_dir / f"{frame_id}.jpg"
-                    r_img_path = rs_dir / f"{frame_id}.jpg"
+                    if frame_id not in stems:
+                        continue
+                    d_img_path = rgb_path(layout.world, frame_id)
+                    r_img_path = rgb_path(layout.wrist, frame_id)
                     
                     if not d_img_path.exists() or not r_img_path.exists(): continue
                         

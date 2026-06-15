@@ -9,6 +9,7 @@ from channel_config import (
     LEFT_CHANNEL, RIGHT_CHANNEL,
     LEFT_MATRIX_CHANNELS, RIGHT_MATRIX_CHANNELS,
 )
+from session_schema import find_session_dirs
 
 
 def load_pressure_csv(pressure_dir: Path) -> list[list[int]]:
@@ -37,14 +38,7 @@ def get_channel_value(row: list[int], channel: int) -> int:
 
 def analyze_sessions(base_path: Path) -> dict:
     """Analyze pressure data across all sessions."""
-    # Find all session directories
-    sessions = []
-    for dji_dir in base_path.rglob("dji"):
-        session_dir = dji_dir.parent
-        if (session_dir / "pressure").is_dir():
-            sessions.append(session_dir)
-
-    sessions.sort(key=lambda p: str(p))
+    sessions = [s for s in find_session_dirs(base_path) if (s / "pressure").is_dir()]
 
     # Statistics containers
     left_channel_values = []

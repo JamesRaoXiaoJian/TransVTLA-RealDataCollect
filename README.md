@@ -1,30 +1,23 @@
 # TransVTLA-RealDataCollect
 
-面向 **机械臂 + DJI 相机 + RealSense + 压力传感器** 的多模态数据采集项目。
+面向 **机械臂 + 双 RealSense RGB-D 相机 + 压力传感器** 的多模态数据采集项目。
 
 这个仓库的目标是把采集、回放、调试和机械臂交互整理成一套脚本工具，方便在实验现场快速记录同步数据，并在采集完成后离线检查每个 session。
 
 ## 项目内容
 
-- **DJI Osmo Action**：通过 UVC / OpenCV 读取视频流。
-- **Intel RealSense D435**：采集 RGB 图像，部分脚本也支持深度图。
+- **Intel RealSense RGB-D 相机 x2**：分别作为 world camera 和 wrist camera，同时采集 RGB 与深度图。
 - **睿尔曼机械臂**：采集当前位姿、关节状态和软件状态。
 - **压力数据**：通过 UDP 接收下位机发送的数据包并保存为 CSV。
 
 ## 目录说明
 
 - `Robotic_Arm/`：机械臂 Python SDK，本仓库已内置。
-- `camera_data.py`：DJI + RealSense 的预览/小批量采集工具。
-- `collect_vision.py`：DJI + RealSense 的交互式录制工具。
-- `collect_robot.py`：DJI + RealSense + 机械臂状态的同步采集工具。
-- `collect_pressure.py`：DJI + RealSense + 机械臂状态 + 压力 UDP 数据保存。
-- `collect_data.py`：多模态数据采集主程序（DJI + RealSense + 机械臂 + 压力 + 夹爪），PySide6 界面。
+- `collect_data.py`：多模态数据采集主程序（双 RealSense RGB-D + 机械臂 + 压力 + 夹爪），PySide6 界面。
+- `test_frequency.py`：逐项测试压力、机械臂、夹爪和双 RealSense 的采集频率。
 - `data_viwer.py`：离线浏览已采集 session 的工具。
-- `pressure_data.py`：压力 UDP 数据接收并保存为 CSV。
-- `herong_9_pressure_data.py`：压力数据的终端实时显示工具。
 - `keybordControl.py`：键盘控制机械臂并记录位姿。
 - `connect_robot.py`：快速连接机械臂并打印当前状态。
-- `test.py`：机械臂 SDK 的快速测试脚本。
 
 ## 环境依赖
 
@@ -38,7 +31,6 @@ pip install pyrealsense2
 说明：
 
 - `pyrealsense2` 需要根据你的 RealSense 驱动和 Python 版本安装。
-- Windows 下 DJI 相机脚本使用 `cv2.CAP_DSHOW` 打开摄像头。
 - 机械臂相关脚本依赖本仓库内的 `Robotic_Arm` 包。
 
 ## 数据输出结构
@@ -48,103 +40,44 @@ pip install pyrealsense2
 ```text
 sessions/
 	session_YYYYMMDD_HHMMSS/
-		dji/
-		realsense_rgb/
+		world_camera/
+			rgb/
+			depth/
+		wrist_camera/
+			rgb/
+			depth/
 		robot_state/
 		pressure/
 ```
 
 不同脚本保存的内容略有差异：
 
-- `dji/`：DJI 图像帧。
-- `realsense_rgb/`：RealSense RGB 图像帧。
+- `world_camera/rgb/`：world RealSense RGB 图像帧。
+- `world_camera/depth/`：world RealSense 深度图，16-bit PNG。
+- `wrist_camera/rgb/`：wrist RealSense RGB 图像帧。
+- `wrist_camera/depth/`：wrist RealSense 深度图，16-bit PNG。
 - `robot_state/`：机械臂状态 JSON。
 - `pressure/`：压力数据 CSV。
 
+旧版 `dji/` + `realsense_rgb/` + `realsense_depth/` 会话仍可由回放、标注和转换脚本读取。
+
 ## 脚本说明与用法
 
-### `camera_data.py`
+### `test_frequency.py`
 
-用途：预览或小批量保存 DJI + RealSense 的图像数据。
+用途：正式采集前检查各传感器和两台 RealSense 同时运行时的实际频率。
 
 常用示例：
 
 ```bash
-python camera_data.py --mode preview
-python camera_data.py --mode capture --output sample_output
-python camera_data.py --list-cameras
+python test_frequency.py --sensor dual_realsense --duration 30
+python test_frequency.py --sensor world_camera --world-serial 1234567890
+python test_frequency.py --sensor wrist_camera --wrist-serial 0987654321
 ```
-
-主要参数：
-
-- `--dji-index`：DJI 摄像头索引。
-- `--mode`：`preview` 或 `capture`。
-- `--output`：输出目录。
-- `--frame-count`：采集帧组数。
-- `--depth-preview`：是否显示/保存深度伪彩色图。
-
-### `collect_vision.py`
-
-用途：交互式采集 DJI + RealSense RGB，同步保存到按时间戳命名的 session 目录。
-
-操作方式：
-
-- `SPACE`：开始 / 暂停录制。
-- `Q` 或 `ESC`：退出。
-
-示例：
-
-```bash
-python collect_vision.py --output sessions
-```
-
-### `collect_robot.py`
-
-用途：采集 DJI + RealSense RGB + 机械臂状态。
-
-录制时会额外保存：
-
-- 机械臂当前状态 JSON。
-- 当前帧对应的关节信息与位姿信息。
-
-示例：
-
-```bash
-python collect_robot.py --arm-host 192.168.31.92 --arm-port 8080
-```
-
-常用参数：
-
-- `--arm-host`：机械臂控制器 IP。
-- `--arm-port`：机械臂控制器端口。
-- `--output`：session 保存目录。
-
-### `collect_pressure.py`
-
-用途：采集 DJI + RealSense RGB + 机械臂状态 + 压力 UDP 数据。
-
-新增内容：
-
-- 启动压力 UDP 监听。
-- 录制期间将压力数据写入 `pressure/pressure.csv`。
-- 压力数据包含 `timestamp_us`、`left`、`right` 三列。
-
-示例：
-
-```bash
-python collect_pressure.py --arm-host 192.168.31.92 --arm-port 8080
-```
-
-常用参数：
-
-- `--arm-host`：机械臂控制器 IP。
-- `--arm-port`：机械臂控制器端口。
-- `--output`：session 保存目录。
-- `--dji-index`：DJI 摄像头索引。
 
 ### `collect_data.py`
 
-用途：采集 DJI + RealSense RGB + 机械臂状态 + 压力 UDP 数据 + 夹爪官方状态 API 数据。
+用途：采集 world/wrist 两台 RealSense 的 RGB-D 数据 + 机械臂状态 + 压力 UDP 数据 + 夹爪官方状态 API 数据。
 
 新增内容：
 
@@ -155,11 +88,16 @@ python collect_pressure.py --arm-host 192.168.31.92 --arm-port 8080
 示例：
 
 ```bash
-python collect_data.py --arm-host 172.25.5.243 --arm-port 8080
+python collect_data.py --arm-host 172.25.5.243 --arm-port 8080 \
+  --world-serial 1234567890 --wrist-serial 0987654321
 ```
 
 常用参数：
 
+- `--world-serial`：world RealSense 序列号；不填时会从已连接设备自动选择。
+- `--wrist-serial`：wrist RealSense 序列号；不填时会从已连接设备自动选择。
+- `--width` / `--height`：RGB 和深度流分辨率，默认 `848x480`。
+- `--rs-fps`：RealSense 设备采集 FPS，默认 `30`。
 - `--disable-gripper`：关闭夹爪状态采集。
 
 ### `data_viwer.py`
@@ -253,18 +191,17 @@ python test.py
 ## 推荐工作流
 
 1. 先运行 `connect_robot.py` 或 `test.py`，确认机械臂可连接。
-2. 再用 `camera_data.py` 检查 DJI 和 RealSense 是否正常出图。
-3. 使用 `pressure_data.py` 或 `herong_9_pressure_data.py` 验证压力通信。
-4. 最后按需要运行 `collect_robot.py`、`collect_pressure.py` 或 `collect_data.py` 开始正式采集。
+2. 再用 `test_frequency.py --sensor dual_realsense` 检查两台 RealSense 是否能同时出 RGB-D。
+3. 使用 `test_frequency.py --sensor pressure` 验证压力通信。
+4. 运行 `collect_data.py` 开始正式采集。
 
 ## 采集注意事项
 
-- 请确认 DJI 摄像头、RealSense 和机械臂的 IP / 端口配置正确。
-- 采集前建议先检查相机索引，避免打开错误设备。
+- 请确认两台 RealSense、压力下位机和机械臂的 IP / 端口配置正确。
+- 采集前建议先用序列号绑定 world/wrist 两台相机，避免设备枚举顺序变化。
 - 压力脚本依赖下位机发送符合 `<Q64h>` 格式的数据包。
 - `sessions/`、`pose_logs/`、`pressure_logs/`、`sample_output/` 等目录属于运行输出，通常不需要提交到 Git。
 
 ## 许可证与说明
 
 本仓库包含机械臂二次开发相关代码和数据采集脚本，适合实验环境下的数据同步采集与调试。
-如果你希望，我还可以继续帮你补一版 **英文 README** 或者把这些脚本整理成一个更清晰的命令行入口说明。

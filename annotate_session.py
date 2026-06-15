@@ -14,7 +14,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
+import cv2
+import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
+from session_schema import (
+    SessionLayout,
+    common_frame_stems,
+    depth_path,
+    find_session_dirs,
+    resolve_session_layout,
+    rgb_path,
+)
 
 # Pressure channel mapping (from Channel Mapping.txt)
 from channel_config import (
@@ -32,15 +42,7 @@ CELL_GAP = 8
 
 
 def find_sessions(base: Path) -> List[Path]:
-    if not base.exists():
-        return []
-    results: List[Path] = []
-    for dji_dir in base.rglob("dji"):
-        session_dir = dji_dir.parent
-        if (session_dir / "realsense_rgb").is_dir():
-            results.append(session_dir)
-    results.sort(key=lambda p: str(p))
-    return results
+    return find_session_dirs(base)
 
 
 # --- Annotations ---
@@ -76,12 +78,6 @@ def session_list_label(session: Path, base: Path) -> str:
     ann = load_annotations(session)
     has_ann = bool(ann.get("task") or ann.get("instruction"))
     return f"{rel}{' *' if has_ann else ''}"
-
-
-def common_frame_stems(dji_dir: Path, rs_dir: Path) -> List[str]:
-    dji = {p.stem for p in dji_dir.glob("*.jpg")}
-    rs = {p.stem for p in rs_dir.glob("*.jpg")}
-    return sorted(dji & rs)
 
 
 # --- Data loaders ---
@@ -323,6 +319,9 @@ class ImageLabel(QtWidgets.QLabel):
 
     def set_pixmap(self, pm: QtGui.QPixmap) -> None:
         self._pixmap = pm
+        if self._pixmap.isNull():
+            self.clear()
+            return
         self._update_scaled()
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
@@ -331,9 +330,41 @@ class ImageLabel(QtWidgets.QLabel):
 
     def _update_scaled(self) -> None:
         if self._pixmap.isNull():
+            self.clear()
             return
         scaled = self._pixmap.scaled(self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
         self.setPixmap(scaled)
+
+
+def _cv_bgr_to_pixmap(img: np.ndarray) -> QtGui.QPixmap:
+    if img is None or img.size == 0:
+        return QtGui.QPixmap()
+    if len(img.shape) == 2:
+        h, w = img.shape
+        qimg = QtGui.QImage(img.data, w, h, w, QtGui.QImage.Format_Grayscale8)
+        return QtGui.QPixmap.fromImage(qimg.copy())
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    h, w, _ = rgb.shape
+    qimg = QtGui.QImage(rgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+    return QtGui.QPixmap.fromImage(qimg.copy())
+
+
+def _load_rgb_pixmap(path: Path) -> QtGui.QPixmap:
+    return QtGui.QPixmap(str(path))
+
+
+def _load_depth_pixmap(path: Path | None) -> QtGui.QPixmap:
+    if path is None or not path.exists():
+        return QtGui.QPixmap()
+    depth = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if depth is None:
+        return QtGui.QPixmap()
+    valid = depth[depth > 0]
+    scale_max = float(np.percentile(valid, 95)) if valid.size else 1.0
+    scale_max = max(scale_max, 1.0)
+    normalized = np.clip(depth.astype(np.float32) * (255.0 / scale_max), 0, 255).astype(np.uint8)
+    preview = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+    return _cv_bgr_to_pixmap(preview)
 
 
 # --- Session data ---
@@ -343,18 +374,14 @@ class SessionData:
     def __init__(self, session_path: Path, base: Path):
         self.session = session_path
         self.base = base
+        self.layout: SessionLayout = resolve_session_layout(session_path)
 
-        self.dji_dir = session_path / "dji"
-        self.rs_dir = session_path / "realsense_rgb"
         self.state_dir = session_path / "robot_state"
         self.pressure_dir = session_path / "pressure"
 
-        if not self.dji_dir.exists() or not self.rs_dir.exists():
-            raise FileNotFoundError("Session missing dji/ or realsense_rgb/ directory.")
-
-        self.stems = common_frame_stems(self.dji_dir, self.rs_dir)
+        self.stems = common_frame_stems(self.layout)
         if not self.stems:
-            raise FileNotFoundError("No overlapping frame names between DJI and RealSense.")
+            raise FileNotFoundError("No overlapping frame names across session camera streams.")
 
         self.robot_state_data = load_robot_state_csv(self.state_dir)
         self.pressure_data = load_pressure_csv(self.pressure_dir)
@@ -393,10 +420,12 @@ class SessionData:
 
     def get_frame_data(
         self, frame_idx: int, session_index: int, total_sessions: int,
-    ) -> tuple[QtGui.QPixmap, QtGui.QPixmap, str, str, list[int]]:
+    ) -> tuple[QtGui.QPixmap, QtGui.QPixmap, QtGui.QPixmap, QtGui.QPixmap, str, str, list[int]]:
         stem = self.stems[frame_idx]
-        dji_pm = QtGui.QPixmap(str(self.dji_dir / f"{stem}.jpg"))
-        rs_pm = QtGui.QPixmap(str(self.rs_dir / f"{stem}.jpg"))
+        world_rgb_pm = _load_rgb_pixmap(rgb_path(self.layout.world, stem))
+        world_depth_pm = _load_depth_pixmap(depth_path(self.layout.world, stem))
+        wrist_rgb_pm = _load_rgb_pixmap(rgb_path(self.layout.wrist, stem))
+        wrist_depth_pm = _load_depth_pixmap(depth_path(self.layout.wrist, stem))
 
         joints, pose = self._get_robot_state(frame_idx)
         g_code, g_pos, g_latency = self._get_gripper_state(frame_idx)
@@ -405,7 +434,7 @@ class SessionData:
 
         session_label = self.session.parent.name + "/" + self.session.name
         header = f"[{session_index + 1}/{total_sessions}] {session_label}  |  Frame {stem}"
-        return dji_pm, rs_pm, header, state_text, pressure_values
+        return world_rgb_pm, world_depth_pm, wrist_rgb_pm, wrist_depth_pm, header, state_text, pressure_values
 
 
 # --- Main window ---
@@ -449,14 +478,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.header_label.setStyleSheet("font-weight: 600; font-size: 14px;")
         right_layout.addWidget(self.header_label)
 
-        # Two cameras side by side
-        cam_row = QtWidgets.QHBoxLayout()
-        cam_row.setSpacing(10)
-        self.dji_label = ImageLabel()
-        self.rs_label = ImageLabel()
-        cam_row.addWidget(self.dji_label, stretch=1)
-        cam_row.addWidget(self.rs_label, stretch=1)
-        right_layout.addLayout(cam_row, stretch=5)
+        cam_grid = QtWidgets.QGridLayout()
+        cam_grid.setSpacing(10)
+        self.world_rgb_label = ImageLabel()
+        self.world_depth_label = ImageLabel()
+        self.wrist_rgb_label = ImageLabel()
+        self.wrist_depth_label = ImageLabel()
+        cam_grid.addWidget(self.world_rgb_label, 0, 0)
+        cam_grid.addWidget(self.world_depth_label, 0, 1)
+        cam_grid.addWidget(self.wrist_rgb_label, 1, 0)
+        cam_grid.addWidget(self.wrist_depth_label, 1, 1)
+        right_layout.addLayout(cam_grid, stretch=5)
 
         self.frame_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.frame_slider.setRange(0, 0)
@@ -518,11 +550,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.session_data:
             return
         idx = int(self.frame_slider.value())
-        dji_pm, rs_pm, header, state_text, pressure_values = self.session_data.get_frame_data(
+        world_rgb_pm, world_depth_pm, wrist_rgb_pm, wrist_depth_pm, header, state_text, pressure_values = self.session_data.get_frame_data(
             idx, self.current_index, len(self.sessions),
         )
-        self.dji_label.set_pixmap(dji_pm)
-        self.rs_label.set_pixmap(rs_pm)
+        self.world_rgb_label.set_pixmap(world_rgb_pm)
+        self.world_depth_label.set_pixmap(world_depth_pm)
+        self.wrist_rgb_label.set_pixmap(wrist_rgb_pm)
+        self.wrist_depth_label.set_pixmap(wrist_depth_pm)
         self.header_label.setText(header)
         self.pressure_dashboard.set_state_info(state_text)
         self.pressure_dashboard.set_values(pressure_values)

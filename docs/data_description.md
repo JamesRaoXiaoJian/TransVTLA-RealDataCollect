@@ -20,14 +20,20 @@ sessions/
 │       │   └── pressure.csv
 │       ├── preprocessed_pressure/         # 预处理后的张量数据
 │       │   └── session_{...}.npz
-│       ├── realsense_rgb/                 # RealSense 相机 RGB 图像
-│       │   ├── 0001.jpg
-│       │   ├── 0002.jpg
-│       │   └── ...
-│       ├── dji/                           # DJI 相机图像
-│       │   ├── 0001.jpg
-│       │   ├── 0002.jpg
-│       │   └── ...
+│       ├── world_camera/                  # world RealSense RGB-D
+│       │   ├── rgb/
+│       │   │   ├── 0001.jpg
+│       │   │   └── ...
+│       │   └── depth/
+│       │       ├── 0001.png               # 16-bit 深度图
+│       │       └── ...
+│       ├── wrist_camera/                  # wrist RealSense RGB-D
+│       │   ├── rgb/
+│       │   │   ├── 0001.jpg
+│       │   │   └── ...
+│       │   └── depth/
+│       │       ├── 0001.png               # 16-bit 深度图
+│       │       └── ...
 │       └── robot_state/                   # 机械臂与夹爪状态
 │           ├── robot_state.csv            # 机械臂关节与末端位姿
 │           └── gripper_state.csv          # 可选，夹爪 RM Plus 实时状态
@@ -103,12 +109,15 @@ gripper_pos = dist["pos"][0]
 - 夹爪动作可由控制程序使用 `arm.rm_set_gripper_position()` 等官方接口完成。
 - 后处理时应使用 `timestamp_us` 和 `rm_plus_read_latency_ms` 判断真实同步质量。
 
-### 4. 相机图像 — `realsense_rgb/` & `dji/`
+### 4. 相机图像 — `world_camera/` & `wrist_camera/`
 
-- 格式：JPEG（`XXXX.jpg`，四位序号）
-- `realsense_rgb`：RealSense 相机视角
-- `dji`：DJI 相机视角
+- RGB 格式：JPEG（`rgb/XXXX.jpg`，四位序号）
+- 深度格式：16-bit PNG（`depth/XXXX.png`，四位序号）
+- `world_camera`：固定外部 RealSense 主视角
+- `wrist_camera`：腕部 RealSense 视角
 - 目标采样率：20 Hz
+
+旧版数据使用 `dji/` 作为 world RGB、`realsense_rgb/` 作为 wrist RGB、`realsense_depth/` 作为 wrist depth。当前回放、标注和转换脚本兼容旧格式。
 
 ## 触觉数据预处理
 
@@ -198,8 +207,10 @@ $$P_{norm} = \text{clip}\left(\frac{\Delta P}{3500},\ 0,\ 1\right)$$
 
 | 模态 | 文件 | 时间戳字段 | 目标采样率 |
 |------|------|------------|------------|
-| DJI 图像 | `dji/XXXX.jpg` | 文件序号对应视觉采样顺序 | 20 Hz |
-| RealSense 图像 | `realsense_rgb/XXXX.jpg` | 文件序号对应视觉采样顺序 | 20 Hz |
+| World RGB | `world_camera/rgb/XXXX.jpg` | 文件序号对应视觉采样顺序 | 20 Hz |
+| World Depth | `world_camera/depth/XXXX.png` | 文件序号对应视觉采样顺序 | 20 Hz |
+| Wrist RGB | `wrist_camera/rgb/XXXX.jpg` | 文件序号对应视觉采样顺序 | 20 Hz |
+| Wrist Depth | `wrist_camera/depth/XXXX.png` | 文件序号对应视觉采样顺序 | 20 Hz |
 | 压力 | `pressure/pressure.csv` | `timestamp_us`，来自压力数据包 | 200 Hz |
 | 机械臂 | `robot_state/robot_state.csv` | `timestamp_us`，采集端系统时间 | 200 Hz |
 | 夹爪 | `robot_state/gripper_state.csv` | `timestamp_us`，采集端系统时间 | 200 Hz 目标，实际取决于状态读取耗时 |

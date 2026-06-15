@@ -1,16 +1,17 @@
-"""Collect synchronized data from DJI, RealSense RGB, robot, pressure, and gripper state.
+"""Collect synchronized data from two RealSense RGB-D cameras, robot, pressure, and gripper state.
 
 Sampling rates:
-    - Visual (DJI + RealSense): 20Hz
+    - Visual (world RealSense + wrist RealSense): 20Hz
     - Tactile/Pressure: 200Hz
     - Robot Arm State: 100Hz
     - Gripper RM Plus State: 200Hz target
 
 Press SPACE to start/stop individual recording sessions. Each session creates a
 timestamped folder containing:
-    - `dji/`             : DJI Osmo Action RGB frames (20Hz)
-    - `realsense_rgb/`   : Intel RealSense RGB frames (20Hz)
-    - `realsense_depth/` : Intel RealSense depth frames (20Hz, 16-bit PNG)
+    - `world_camera/rgb/`   : world RealSense RGB frames (20Hz)
+    - `world_camera/depth/` : world RealSense depth frames (20Hz, 16-bit PNG)
+    - `wrist_camera/rgb/`   : wrist RealSense RGB frames (20Hz)
+    - `wrist_camera/depth/` : wrist RealSense depth frames (20Hz, 16-bit PNG)
     - `robot_state/`     : CSV robot arm state + gripper state
     - `pressure/`        : CSV pressure samples at 200Hz
 
@@ -26,22 +27,25 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from timestamp_utils import get_timestamp_us
+from session_schema import (
+    WORLD_CAMERA,
+    WRIST_CAMERA,
+    camera_depth_dir,
+    camera_rgb_dir,
+)
 
 from collectors import (
-    DJICamera,
     GripperStateCollector,
     PressureCollector,
     RealSenseRGB,
     RobotArmCollector,
 )
-from collectors.dji_camera import DEFAULT_DJI_INDEX
 from collectors.pressure import (
     DEFAULT_PRESSURE_LOCAL_PORT,
     DEFAULT_PRESSURE_REMOTE_IP,
@@ -62,17 +66,19 @@ from channel_config import (
 @dataclass
 class SessionPaths:
     root: Path
-    dji: Path
-    realsense: Path
-    realsense_depth: Path
+    world_rgb: Path
+    world_depth: Path
+    wrist_rgb: Path
+    wrist_depth: Path
     pressure: Path
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DJI + RealSense + robot arm + pressure + gripper recorder.")
-    parser.add_argument("--dji-index", type=int, default=DEFAULT_DJI_INDEX, help="OpenCV index for DJI camera.")
-    parser.add_argument("--width", type=int, default=1280, help="Frame width for both streams.")
-    parser.add_argument("--height", type=int, default=720, help="Frame height for both streams.")
+    parser = argparse.ArgumentParser(description="Dual RealSense + robot arm + pressure + gripper recorder.")
+    parser.add_argument("--world-serial", default=None, help="Serial number for the world RealSense camera.")
+    parser.add_argument("--wrist-serial", default=None, help="Serial number for the wrist RealSense camera.")
+    parser.add_argument("--width", type=int, default=848, help="RealSense RGB/depth frame width.")
+    parser.add_argument("--height", type=int, default=480, help="RealSense RGB/depth frame height.")
     parser.add_argument("--rs-fps", type=int, default=30, help="RealSense camera FPS (supports 30/60/90).")
     parser.add_argument("--output", type=Path, default=Path("sessions"), help="Base directory for recordings.")
     parser.add_argument(
@@ -95,16 +101,24 @@ def build_parser() -> argparse.ArgumentParser:
 def create_session_paths(base: Path, prefix: str) -> SessionPaths:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     session_root = base / f"{prefix}_{timestamp}"
-    dji_dir = session_root / "dji"
-    rs_dir = session_root / "realsense_rgb"
-    rs_depth_dir = session_root / "realsense_depth"
+    world_rgb_dir = camera_rgb_dir(session_root, WORLD_CAMERA)
+    world_depth_dir = camera_depth_dir(session_root, WORLD_CAMERA)
+    wrist_rgb_dir = camera_rgb_dir(session_root, WRIST_CAMERA)
+    wrist_depth_dir = camera_depth_dir(session_root, WRIST_CAMERA)
     pressure_dir = session_root / "pressure"
 
-    for directory in (dji_dir, rs_dir, rs_depth_dir, pressure_dir):
+    for directory in (world_rgb_dir, world_depth_dir, wrist_rgb_dir, wrist_depth_dir, pressure_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
     print(f"Recording session created: {session_root}")
-    return SessionPaths(root=session_root, dji=dji_dir, realsense=rs_dir, realsense_depth=rs_depth_dir, pressure=pressure_dir)
+    return SessionPaths(
+        root=session_root,
+        world_rgb=world_rgb_dir,
+        world_depth=world_depth_dir,
+        wrist_rgb=wrist_rgb_dir,
+        wrist_depth=wrist_depth_dir,
+        pressure=pressure_dir,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +138,19 @@ def _bgr_to_qimage(img: np.ndarray) -> QtGui.QImage:
     bytes_per_line = 3 * w
     qimg = QtGui.QImage(rgb.data, w, h, bytes_per_line, QtGui.QImage.Format_RGB888)
     return qimg.copy()
+
+
+def _depth_to_preview_bgr(depth: np.ndarray) -> np.ndarray:
+    if depth is None or depth.size == 0:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+    valid = depth[depth > 0]
+    if valid.size:
+        scale_max = float(np.percentile(valid, 95))
+    else:
+        scale_max = 1.0
+    scale_max = max(scale_max, 1.0)
+    normalized = np.clip(depth.astype(np.float32) * (255.0 / scale_max), 0, 255).astype(np.uint8)
+    return cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
 
 
 class ImageLabel(QtWidgets.QLabel):
@@ -309,11 +336,29 @@ class MainWindow(QtWidgets.QMainWindow):
         pal.setColor(QtGui.QPalette.Window, QtCore.Qt.white)
         self.setPalette(pal)
 
-        self.dji = DJICamera(index=args.dji_index, width=args.width, height=args.height)
-        # RealSense 使用优化配置：后台线程 + 关闭实时深度滤波
-        self.rs_camera = RealSenseRGB(
-            width=848, height=480, fps=args.rs_fps,
+        world_serial, wrist_serial, devices = RealSenseRGB.resolve_serial_pair(
+            args.world_serial, args.wrist_serial,
+        )
+        if devices:
+            print("Detected RealSense devices:")
+            for dev in devices:
+                print(f"  - {dev['name']} serial={dev['serial']}")
+        if world_serial is None:
+            print("Warning: no world RealSense serial resolved; world camera will use fallback frames.")
+        if wrist_serial is None:
+            print("Warning: no wrist RealSense serial resolved; wrist camera will use fallback frames.")
+
+        self.world_camera = RealSenseRGB(
+            width=args.width, height=args.height, fps=args.rs_fps,
             enable_depth=True, enable_filters=False,
+            serial_number=world_serial, name="world_camera",
+            enabled=(world_serial is not None or not devices),
+        )
+        self.wrist_camera = RealSenseRGB(
+            width=args.width, height=args.height, fps=args.rs_fps,
+            enable_depth=True, enable_filters=False,
+            serial_number=wrist_serial, name="wrist_camera",
+            enabled=(wrist_serial is not None or not devices),
         )
         self.robot = RobotArmCollector(host=args.arm_host, port=args.arm_port)
         self.gripper: GripperStateCollector | None = None
@@ -352,13 +397,17 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setSpacing(6)
 
         # Camera row
-        cam_row = QtWidgets.QHBoxLayout()
-        cam_row.setSpacing(10)
-        self.dji_label = ImageLabel()
-        self.rs_label = ImageLabel()
-        cam_row.addWidget(self.dji_label, stretch=1)
-        cam_row.addWidget(self.rs_label, stretch=1)
-        layout.addLayout(cam_row, stretch=5)
+        cam_grid = QtWidgets.QGridLayout()
+        cam_grid.setSpacing(8)
+        self.world_rgb_label = ImageLabel()
+        self.world_depth_label = ImageLabel()
+        self.wrist_rgb_label = ImageLabel()
+        self.wrist_depth_label = ImageLabel()
+        cam_grid.addWidget(self.world_rgb_label, 0, 0)
+        cam_grid.addWidget(self.world_depth_label, 0, 1)
+        cam_grid.addWidget(self.wrist_rgb_label, 1, 0)
+        cam_grid.addWidget(self.wrist_depth_label, 1, 1)
+        layout.addLayout(cam_grid, stretch=5)
 
         # Status label
         self.status_label = QtWidgets.QLabel("Status: IDLE | Frames: 0")
@@ -375,10 +424,10 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---- Collector lifecycle ----
 
     def _start_collectors(self) -> None:
-        print(f"Opening DJI camera at index {self.args.dji_index}...")
-        self.dji.start()
-        print("Starting RealSense RGB pipeline...")
-        self.rs_camera.start()
+        print("Starting world RealSense RGB-D pipeline...")
+        self.world_camera.start()
+        print("Starting wrist RealSense RGB-D pipeline...")
+        self.wrist_camera.start()
         print(f"Connecting robot arm at {self.args.arm_host}:{self.args.arm_port}...")
         self.robot.connect()
         print("Starting robot arm collector...")
@@ -393,8 +442,8 @@ class MainWindow(QtWidgets.QMainWindow):
         print("Press SPACE to start/stop recording, Q/ESC to exit.")
 
     def _stop_collectors(self) -> None:
-        self.dji.stop()
-        self.rs_camera.stop()
+        self.world_camera.stop()
+        self.wrist_camera.stop()
         self.robot.stop()
         if self.gripper is not None:
             self.gripper.stop()
@@ -415,7 +464,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.frames_writer = csv.writer(self.frames_file)
         self.frames_writer.writerow([
             "frame_id", "capture_monotonic_us",
-            "dji_save_us", "realsense_save_us", "depth_save_us",
+            "world_rgb_save_us", "world_depth_save_us",
+            "wrist_rgb_save_us", "wrist_depth_save_us",
         ])
 
         self.frame_id = 0
@@ -442,11 +492,15 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---- Timer callback (20Hz) ----
 
     def _on_timer(self) -> None:
-        dji_frame = self.dji.read()
-        rs_frame = self.rs_camera.read()
+        world_rgb = self.world_camera.read()
+        world_depth = self.world_camera.read_depth()
+        wrist_rgb = self.wrist_camera.read()
+        wrist_depth = self.wrist_camera.read_depth()
 
-        self.dji_label.set_image(dji_frame)
-        self.rs_label.set_image(rs_frame)
+        self.world_rgb_label.set_image(world_rgb)
+        self.world_depth_label.set_image(_depth_to_preview_bgr(world_depth))
+        self.wrist_rgb_label.set_image(wrist_rgb)
+        self.wrist_depth_label.set_image(_depth_to_preview_bgr(wrist_depth))
 
         # Status
         status = "REC" if self.recording else "IDLE"
@@ -482,25 +536,29 @@ class MainWindow(QtWidgets.QMainWindow):
             # 使用 cv2.imwrite 保存 JPEG (Q85)，替代 QImage.save（更快）
             capture_us = get_timestamp_us()
             cv2.imwrite(
-                str(self.session_paths.dji / image_name), dji_frame,
+                str(self.session_paths.world_rgb / image_name), world_rgb,
                 [cv2.IMWRITE_JPEG_QUALITY, 85],
             )
-            dji_save_us = get_timestamp_us()
+            world_rgb_save_us = get_timestamp_us()
+
+            cv2.imwrite(str(self.session_paths.world_depth / depth_name), world_depth)
+            world_depth_save_us = get_timestamp_us()
 
             cv2.imwrite(
-                str(self.session_paths.realsense / image_name), rs_frame,
+                str(self.session_paths.wrist_rgb / image_name), wrist_rgb,
                 [cv2.IMWRITE_JPEG_QUALITY, 85],
             )
-            rs_save_us = get_timestamp_us()
+            wrist_rgb_save_us = get_timestamp_us()
 
-            depth_frame = self.rs_camera.read_depth()
-            cv2.imwrite(str(self.session_paths.realsense_depth / depth_name), depth_frame)
-            depth_save_us = get_timestamp_us()
+            cv2.imwrite(str(self.session_paths.wrist_depth / depth_name), wrist_depth)
+            wrist_depth_save_us = get_timestamp_us()
 
             # 记录帧元数据
             if self.frames_writer is not None:
                 self.frames_writer.writerow([
-                    self.frame_id, capture_us, dji_save_us, rs_save_us, depth_save_us,
+                    self.frame_id, capture_us,
+                    world_rgb_save_us, world_depth_save_us,
+                    wrist_rgb_save_us, wrist_depth_save_us,
                 ])
                 if self.frame_id % 10 == 0:
                     self.frames_file.flush()

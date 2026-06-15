@@ -5,8 +5,12 @@ Phase2 RLDS 数据集构建脚本
 
 数据源结构:
   sessions/{object_type}_sampleN/session_YYYYMMDD_HHMMSS/
-    ├── dji/                  0001.jpg ~ NNNN.jpg  (20 Hz)
-    ├── realsense_rgb/        0001.jpg ~ NNNN.jpg  (20 Hz)
+    ├── world_camera/
+    │   ├── rgb/              0001.jpg ~ NNNN.jpg  (20 Hz)
+    │   └── depth/            0001.png ~ NNNN.png  (20 Hz, 16-bit)
+    ├── wrist_camera/
+    │   ├── rgb/              0001.jpg ~ NNNN.jpg  (20 Hz)
+    │   └── depth/            0001.png ~ NNNN.png  (20 Hz, 16-bit)
     ├── robot_state/          robot_state.csv      (200 Hz)
     └── preprocessed_pressure/ {session}.npz       (滑窗后的触觉帧)
 
@@ -32,6 +36,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import cv2
 import numpy as np
 import tensorflow_datasets as tfds
+from session_schema import common_frame_stems, resolve_session_layout, rgb_path
 
 # ============================================================
 # 采样率常量
@@ -220,7 +225,7 @@ class Phase2RobotData(tfds.core.GeneratorBasedBuilder):
                 "steps": tfds.features.Dataset({
                     "observation": tfds.features.FeaturesDict({
                         "primary_image": tfds.features.Image(
-                            shape=(224, 224, 3), dtype=np.uint8, doc="DJI 主视角"
+                            shape=(224, 224, 3), dtype=np.uint8, doc="World RealSense 主视角"
                         ),
                         "wrist_image": tfds.features.Image(
                             shape=(224, 224, 3), dtype=np.uint8, doc="RealSense 腕部视角"
@@ -353,17 +358,19 @@ class Phase2RobotData(tfds.core.GeneratorBasedBuilder):
     ) -> Optional[List[Dict]]:
         """处理单个 session，返回 step 列表，以视觉帧为基准。"""
 
-        dji_dir = session_dir / "dji"
-        rs_dir = session_dir / "realsense_rgb"
+        try:
+            layout = resolve_session_layout(session_dir)
+        except FileNotFoundError:
+            return None
+
         csv_path = session_dir / "robot_state" / "robot_state.csv"
         npz_path = session_dir / "preprocessed_pressure" / f"{session_dir.name}.npz"
 
         # 1) 收集视觉帧: 按文件名排序，获取帧数 N_vis
-        dji_files = sorted(dji_dir.glob("*.jpg"))
-        rs_files = sorted(rs_dir.glob("*.jpg"))
-        if not dji_files or not rs_files:
+        stems = common_frame_stems(layout)
+        if not stems:
             return None
-        n_vis = min(len(dji_files), len(rs_files))
+        n_vis = len(stems)
 
         # 2) 加载机械臂状态 CSV
         if not csv_path.exists():
@@ -406,10 +413,10 @@ class Phase2RobotData(tfds.core.GeneratorBasedBuilder):
 
         # 5) 构建每个 step
         steps = []
-        for i in range(n_vis):
+        for i, stem in enumerate(stems):
             # 图像
-            p_img = self._load_image(dji_files[i])
-            w_img = self._load_image(rs_files[i])
+            p_img = self._load_image(rgb_path(layout.world, stem))
+            w_img = self._load_image(rgb_path(layout.wrist, stem))
             if p_img is None or w_img is None:
                 continue
 

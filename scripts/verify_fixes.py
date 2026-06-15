@@ -8,6 +8,10 @@ Usage:
 import csv
 import os
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from session_schema import common_frame_stems, find_session_dirs, resolve_session_layout
 
 SESSIONS_ROOT = Path("dataset/phase2_realdata_sessions/sessions")
 
@@ -18,9 +22,7 @@ def verify_f1_pressure_monotonic():
     failures = []
     total = 0
 
-    for sdir in sorted(SESSIONS_ROOT.iterdir()):
-        if not sdir.is_dir() or not sdir.name.startswith("session_"):
-            continue
+    for sdir in find_session_dirs(SESSIONS_ROOT):
         total += 1
         csv_path = sdir / "pressure" / "pressure.csv"
         if not csv_path.exists():
@@ -52,9 +54,7 @@ def verify_f2_f3_gripper_clean():
     dupe_failures = []
     total = 0
 
-    for sdir in sorted(SESSIONS_ROOT.iterdir()):
-        if not sdir.is_dir() or not sdir.name.startswith("session_"):
-            continue
+    for sdir in find_session_dirs(SESSIONS_ROOT):
         total += 1
         csv_path = sdir / "robot_state" / "gripper_state.csv"
         if not csv_path.exists():
@@ -125,21 +125,36 @@ def verify_structure_integrity():
     issues = []
     total = 0
 
-    required_dirs = ["dji", "realsense_rgb", "realsense_depth", "pressure", "robot_state"]
     required_files = [
         ("pressure", "pressure.csv"),
         ("robot_state", "robot_state.csv"),
         ("robot_state", "gripper_state.csv"),
     ]
 
-    for sdir in sorted(SESSIONS_ROOT.iterdir()):
-        if not sdir.is_dir() or not sdir.name.startswith("session_"):
-            continue
+    for sdir in find_session_dirs(SESSIONS_ROOT):
         total += 1
+        try:
+            layout = resolve_session_layout(sdir)
+        except FileNotFoundError as exc:
+            issues.append(f"{sdir.name}: {exc}")
+            continue
 
-        for d in required_dirs:
-            if not (sdir / d).is_dir():
-                issues.append(f"{sdir.name}: missing directory {d}/")
+        camera_dirs = [layout.world.rgb, layout.wrist.rgb]
+        if layout.world.depth is not None:
+            camera_dirs.append(layout.world.depth)
+        if layout.wrist.depth is not None:
+            camera_dirs.append(layout.wrist.depth)
+        for directory in camera_dirs:
+            if not directory.is_dir():
+                issues.append(f"{sdir.name}: missing directory {directory.relative_to(sdir)}/")
+
+        if not layout.is_legacy:
+            if layout.world.depth is None or layout.wrist.depth is None:
+                issues.append(f"{sdir.name}: dual RealSense session missing depth directory")
+
+        stems = common_frame_stems(layout)
+        if not stems:
+            issues.append(f"{sdir.name}: no complete synchronized camera frame set")
 
         for subdir, fname in required_files:
             fpath = sdir / subdir / fname

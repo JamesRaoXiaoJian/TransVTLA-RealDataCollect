@@ -13,13 +13,9 @@ except ImportError:  # pragma: no cover
 
 
 class RealSenseRGB:
-    """RealSense 相机采集器（后台线程版本）。
+    """RealSense RGB-D camera collector.
 
-    优化点：
-    - 后台线程持续采集，read() 非阻塞
-    - 深度滤波可选（默认关闭，离线处理）
-    - 关闭自动曝光，保证训练数据一致性
-    - 默认 848x480@30fps
+    The class name is kept for backward compatibility with older scripts.
     """
 
     def __init__(
@@ -29,12 +25,18 @@ class RealSenseRGB:
         fps: int = 30,
         enable_depth: bool = True,
         enable_filters: bool = False,
+        serial_number: str | None = None,
+        name: str = "RealSense",
+        enabled: bool = True,
     ):
         self.width = width
         self.height = height
         self.fps = fps
         self.enable_depth = enable_depth
         self.enable_filters = enable_filters
+        self.serial_number = serial_number
+        self.name = name
+        self.enabled = enabled
 
         self.pipeline: Optional[object] = None
         self.align: Optional[object] = None
@@ -43,19 +45,61 @@ class RealSenseRGB:
 
         self._last_color: Optional[np.ndarray] = None
         self._last_depth: Optional[np.ndarray] = None
+        self._frame_count = 0
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
 
+    @staticmethod
+    def list_devices() -> list[dict[str, str]]:
+        if rs is None:
+            return []
+        devices: list[dict[str, str]] = []
+        try:
+            ctx = rs.context()
+            for dev in ctx.query_devices():
+                serial = dev.get_info(rs.camera_info.serial_number)
+                name = dev.get_info(rs.camera_info.name)
+                devices.append({"serial": serial, "name": name})
+        except Exception:
+            return []
+        return devices
+
+    @staticmethod
+    def resolve_serial_pair(
+        world_serial: str | None = None,
+        wrist_serial: str | None = None,
+    ) -> tuple[str | None, str | None, list[dict[str, str]]]:
+        devices = RealSenseRGB.list_devices()
+        serials = [dev["serial"] for dev in devices]
+
+        if world_serial and wrist_serial and world_serial == wrist_serial:
+            raise ValueError("world and wrist RealSense serial numbers must be different.")
+
+        if world_serial is None:
+            world_serial = next((serial for serial in serials if serial != wrist_serial), None)
+        if wrist_serial is None:
+            wrist_serial = next((serial for serial in serials if serial != world_serial), None)
+
+        return world_serial, wrist_serial, devices
+
     def start(self) -> None:
+        if not self.enabled:
+            self.pipeline = None
+            self.available = False
+            print(f"Warning: {self.name} disabled. Using zero-filled RealSense frames.")
+            return
+
         if rs is None:
             self.pipeline = None
             self.available = False
-            print("Warning: pyrealsense2 not installed. Using zero-filled RealSense frames.")
+            print(f"Warning: pyrealsense2 not installed. Using zero-filled {self.name} frames.")
             return
 
         pipeline = rs.pipeline()
         config = rs.config()
+        if self.serial_number:
+            config.enable_device(self.serial_number)
 
         # 配置 color 流
         config.enable_stream(
@@ -74,7 +118,7 @@ class RealSenseRGB:
             self.pipeline = None
             self.available = False
             print(
-                "Warning: RealSense pipeline could not start. "
+                f"Warning: {self.name} pipeline could not start. "
                 "Using zero-filled frames. Details: "
                 f"{exc}"
             )
@@ -113,7 +157,8 @@ class RealSenseRGB:
         self._thread.start()
         self.available = True
 
-        print(f"RealSense: {self.width}x{self.height} @{self.fps}fps, depth={self.enable_depth}")
+        serial_text = f", serial={self.serial_number}" if self.serial_number else ""
+        print(f"{self.name}: {self.width}x{self.height} @{self.fps}fps, depth={self.enable_depth}{serial_text}")
 
     def _capture_loop(self) -> None:
         """后台线程：持续采集帧，缓存最新帧。"""
@@ -146,6 +191,7 @@ class RealSenseRGB:
                 with self._lock:
                     self._last_color = color_data
                     self._last_depth = depth_data
+                    self._frame_count += 1
 
             except Exception as e:
                 if self._running:
@@ -165,6 +211,10 @@ class RealSenseRGB:
                 return self._last_depth.copy()
         return self._zero_depth()
 
+    def get_frame_count(self) -> int:
+        with self._lock:
+            return self._frame_count
+
     def stop(self) -> None:
         self._running = False
         if self._thread is not None:
@@ -176,6 +226,7 @@ class RealSenseRGB:
         self.align = None
         self._last_color = None
         self._last_depth = None
+        self._frame_count = 0
         self.available = False
 
     def _zero_frame(self) -> np.ndarray:

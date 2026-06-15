@@ -13,8 +13,9 @@
     python test_frequency.py --sensor pressure  # 直接测试压力传感器
     python test_frequency.py --sensor robot     # 直接测试机械臂
     python test_frequency.py --sensor gripper   # 直接测试夹爪
-    python test_frequency.py --sensor dji       # 直接测试 DJI 相机
-    python test_frequency.py --sensor realsense # 直接测试 RealSense
+    python test_frequency.py --sensor world_camera
+    python test_frequency.py --sensor wrist_camera
+    python test_frequency.py --sensor dual_realsense
     python test_frequency.py --sensor all       # 依次测试全部
 
 按 Ctrl+C 停止当前测试并显示报告。
@@ -30,10 +31,11 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional
 
 # 强制 CPU，避免 GPU 初始化卡顿
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+TEST_ARGS: argparse.Namespace | None = None
 
 # ============================================================
 # 频率统计核心类
@@ -321,46 +323,144 @@ def test_gripper(stats: FreqStats) -> None:
     return collector
 
 
-def test_dji(stats: FreqStats) -> None:
-    """测试 DJI 相机采集频率。"""
-    from collectors.dji_camera import DJICamera
-
-    collector = DJICamera()
-    collector.start()
-
-    def patched_loop():
-        while collector.running:
-            frame = collector.read()
-            if frame is not None:
-                stats.record()
-            time.sleep(0.001)
-
-    collector.running = True
-    collector.thread = threading.Thread(target=patched_loop, daemon=True)
-    collector.thread.start()
-
-    return collector
+def _current_args() -> argparse.Namespace:
+    if TEST_ARGS is not None:
+        return TEST_ARGS
+    return argparse.Namespace(
+        world_serial=None,
+        wrist_serial=None,
+        width=848,
+        height=480,
+        rs_fps=30,
+    )
 
 
-def test_realsense(stats: FreqStats) -> None:
-    """测试 RealSense 相机采集频率。"""
+def _print_realsense_devices(devices: list[dict[str, str]]) -> None:
+    if not devices:
+        print("  未检测到 RealSense 设备，或 pyrealsense2 不可用")
+        return
+    print("  检测到 RealSense 设备:")
+    for dev in devices:
+        print(f"    - {dev['name']} serial={dev['serial']}")
+
+
+def _start_realsense_counter(
+    stats: FreqStats,
+    serial: str | None,
+    name: str,
+    enabled: bool,
+):
     from collectors.realsense_rgb import RealSenseRGB
 
-    collector = RealSenseRGB()
+    args = _current_args()
+    collector = RealSenseRGB(
+        width=args.width,
+        height=args.height,
+        fps=args.rs_fps,
+        enable_depth=True,
+        enable_filters=False,
+        serial_number=serial,
+        name=name,
+        enabled=enabled,
+    )
     collector.start()
 
-    def patched_loop():
-        while collector.running:
-            frame = collector.read()
-            if frame is not None:
-                stats.record()
-            time.sleep(0.001)
+    def monitor_loop():
+        last_count = 0
+        while getattr(collector, "_running", False):
+            count = collector.get_frame_count()
+            if count > last_count:
+                for _ in range(count - last_count):
+                    stats.record()
+                last_count = count
+            time.sleep(0.005)
 
-    collector.running = True
-    collector.thread = threading.Thread(target=patched_loop, daemon=True)
-    collector.thread.start()
+    collector.monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+    collector.monitor_thread.start()
 
     return collector
+
+
+def _resolve_realsense_pair() -> tuple[str | None, str | None, list[dict[str, str]]]:
+    from collectors.realsense_rgb import RealSenseRGB
+
+    args = _current_args()
+    return RealSenseRGB.resolve_serial_pair(args.world_serial, args.wrist_serial)
+
+
+def test_world_realsense(stats: FreqStats):
+    """测试 world RealSense RGB-D 采集频率。"""
+    world_serial, _wrist_serial, devices = _resolve_realsense_pair()
+    _print_realsense_devices(devices)
+    enabled = world_serial is not None or not devices
+    return _start_realsense_counter(stats, world_serial, "world_camera", enabled)
+
+
+def test_wrist_realsense(stats: FreqStats):
+    """测试 wrist RealSense RGB-D 采集频率。"""
+    _world_serial, wrist_serial, devices = _resolve_realsense_pair()
+    _print_realsense_devices(devices)
+    enabled = wrist_serial is not None or not devices
+    return _start_realsense_counter(stats, wrist_serial, "wrist_camera", enabled)
+
+
+class DualRealSenseCollector:
+    def __init__(self, world, wrist, monitor_thread: threading.Thread):
+        self.world = world
+        self.wrist = wrist
+        self.monitor_thread = monitor_thread
+
+    def stop(self) -> None:
+        self.world.stop()
+        self.wrist.stop()
+        self.monitor_thread.join(timeout=1.0)
+
+
+def test_dual_realsense(stats: FreqStats):
+    """测试两台 RealSense 同时采集时的同步对频率。"""
+    from collectors.realsense_rgb import RealSenseRGB
+
+    args = _current_args()
+    world_serial, wrist_serial, devices = _resolve_realsense_pair()
+    _print_realsense_devices(devices)
+
+    world = RealSenseRGB(
+        width=args.width,
+        height=args.height,
+        fps=args.rs_fps,
+        enable_depth=True,
+        enable_filters=False,
+        serial_number=world_serial,
+        name="world_camera",
+        enabled=(world_serial is not None or not devices),
+    )
+    wrist = RealSenseRGB(
+        width=args.width,
+        height=args.height,
+        fps=args.rs_fps,
+        enable_depth=True,
+        enable_filters=False,
+        serial_number=wrist_serial,
+        name="wrist_camera",
+        enabled=(wrist_serial is not None or not devices),
+    )
+
+    world.start()
+    wrist.start()
+
+    def monitor_loop():
+        last_pairs = 0
+        while getattr(world, "_running", False) or getattr(wrist, "_running", False):
+            pairs = min(world.get_frame_count(), wrist.get_frame_count())
+            if pairs > last_pairs:
+                for _ in range(pairs - last_pairs):
+                    stats.record()
+                last_pairs = pairs
+            time.sleep(0.005)
+
+    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+    monitor_thread.start()
+    return DualRealSenseCollector(world, wrist, monitor_thread)
 
 
 # ============================================================
@@ -386,16 +486,22 @@ SENSOR_REGISTRY = {
         "test_fn": test_gripper,
         "requires_network": True,
     },
-    "dji": {
-        "name": "DJI 相机",
+    "world_camera": {
+        "name": "World RealSense RGB-D",
         "target_hz": 20,
-        "test_fn": test_dji,
+        "test_fn": test_world_realsense,
         "requires_network": False,
     },
-    "realsense": {
-        "name": "RealSense 相机",
+    "wrist_camera": {
+        "name": "Wrist RealSense RGB-D",
         "target_hz": 20,
-        "test_fn": test_realsense,
+        "test_fn": test_wrist_realsense,
+        "requires_network": False,
+    },
+    "dual_realsense": {
+        "name": "双 RealSense 同步对",
+        "target_hz": 20,
+        "test_fn": test_dual_realsense,
         "requires_network": False,
     },
 }
@@ -510,11 +616,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="测试时长（秒），不指定则持续到 Ctrl+C",
     )
+    parser.add_argument("--world-serial", default=None, help="world RealSense 序列号")
+    parser.add_argument("--wrist-serial", default=None, help="wrist RealSense 序列号")
+    parser.add_argument("--width", type=int, default=848, help="RealSense RGB/depth 宽度")
+    parser.add_argument("--height", type=int, default=480, help="RealSense RGB/depth 高度")
+    parser.add_argument("--rs-fps", type=int, default=30, help="RealSense 设备采集 FPS")
     return parser.parse_args()
 
 
 def main() -> None:
+    global TEST_ARGS
     args = parse_args()
+    TEST_ARGS = args
 
     if args.sensor:
         if args.sensor == "all":
