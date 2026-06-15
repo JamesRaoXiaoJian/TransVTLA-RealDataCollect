@@ -8,6 +8,12 @@
   - 间隔分布直方图
   - 丢帧检测
 
+目标频率（基于 30Hz 视觉帧率的整数倍设计）:
+  - 压力传感器: 200 Hz (UDP)
+  - 机械臂状态: 120 Hz (= 4 × 30Hz)
+  - 夹爪状态: 120 Hz (= 4 × 30Hz)
+  - RealSense: 30 Hz (硬件限制)
+
 用法:
     python test_frequency.py                    # 交互式选择传感器
     python test_frequency.py --sensor pressure  # 直接测试压力传感器
@@ -277,7 +283,7 @@ def test_robot(stats: FreqStats) -> None:
     def patched_poll():
         while collector.running:
             try:
-                code, data = collector.robot.rm_get_arm_current_state()
+                code, data = collector.robot.rm_get_current_arm_state()
                 stats.record()
                 with collector.lock:
                     collector.latest_state = {"code": code, "data": data}
@@ -478,13 +484,13 @@ SENSOR_REGISTRY = {
     },
     "robot": {
         "name": "机械臂状态",
-        "target_hz": 100,
+        "target_hz": 120,
         "test_fn": test_robot,
         "requires_network": True,
     },
     "gripper": {
         "name": "夹爪状态 (RM Plus)",
-        "target_hz": 100,
+        "target_hz": 120,
         "test_fn": test_gripper,
         "requires_network": True,
     },

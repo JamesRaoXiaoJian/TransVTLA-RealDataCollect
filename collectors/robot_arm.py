@@ -10,10 +10,10 @@ from Robotic_Arm.rm_robot_interface import RoboticArm, rm_thread_mode_e
 
 from timestamp_utils import get_timestamp_us
 
-DEFAULT_ARM_HOST = "192.168.31.92"
+DEFAULT_ARM_HOST = "192.168.1.18"
 DEFAULT_ARM_PORT = 8080
-ROBOT_ARM_FPS = 100  # 网线直连后可达 ~100-200 Hz
-ROBOT_ARM_INTERVAL_S = 0.0  # 不额外 sleep，让 SDK 调用耗时决定节奏
+ROBOT_ARM_FPS = 120  # 目标频率（SDK 实测 ~122Hz 自由运行）
+ROBOT_ARM_INTERVAL_S = 0.0  # 不限速：SDK 调用呈双峰分布（快路径~0ms / 慢路径~15ms），加 sleep 反而降频
 ROBOT_ARM_BATCH_SIZE = 100
 ROBOT_ARM_FLUSH_INTERVAL_S = 0.1
 
@@ -118,7 +118,7 @@ class RobotArmCollector:
             return list(self.latest_pose) if self.latest_pose else None
 
     def _poll_loop(self) -> None:
-        """轮询机械臂状态。网线直连时单次调用 ~1-5ms，可达 ~100-200 Hz。"""
+        """轮询机械臂状态。SDK 自由运行 ~122Hz，靠时间戳对齐到 30Hz 视觉帧。"""
         while self.running:
             if self.handle is None:
                 time.sleep(0.1)
@@ -152,8 +152,6 @@ class RobotArmCollector:
                     row += list(pose) if pose else [0] * 6
                     self.row_buffer.append(row)
                     self._flush_locked(force=False)
-
-            # 不 sleep，让 SDK 调用耗时决定节奏
 
     def _flush_locked(self, force: bool) -> None:
         if not self.recording or self.csv_writer is None or self.csv_file is None:
