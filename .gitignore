@@ -42,6 +42,8 @@ sessions414/
 sample_output/
 backup_*/
 dataset/
+isaacsim/scripts/runs/
+isaacsim/scripts/real_data/
 
 # Common output files
 *.csv

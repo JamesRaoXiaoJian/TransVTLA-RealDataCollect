@@ -1,0 +1,600 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Multi-env Franka front-box data collection with world/wrist cameras and transparent cube masks."
+    )
+    parser.add_argument("--headless", action="store_true", help="Run without opening the Isaac Sim GUI.")
+    parser.add_argument("--no-headless", action="store_false", dest="headless", help="Run with the Isaac Sim GUI.")
+    parser.set_defaults(headless=True)
+    parser.add_argument("--env-usd", type=Path, default=Path("USDFiles") / "franka_env.usd")
+    parser.add_argument("--num-envs", type=int, default=2)
+    parser.add_argument("--env-spacing", type=float, default=3.5)
+    parser.add_argument("--episodes", type=int, default=10)
+    parser.add_argument("--steps-per-episode", type=int, default=360)
+    parser.add_argument("--settle-steps", type=int, default=8)
+    parser.add_argument("--save-image-interval", type=int, default=10)
+    parser.add_argument("--output-dir", type=Path, default=SCRIPT_DIR / "runs" / "collected_data")
+    parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--transparent-label", type=str, default="transparent_obj")
+    parser.add_argument("--world-camera-width", type=int, default=640)
+    parser.add_argument("--world-camera-height", type=int, default=480)
+    parser.add_argument("--wrist-camera-width", type=int, default=320)
+    parser.add_argument("--wrist-camera-height", type=int, default=240)
+    parser.add_argument("--device", type=str, choices=["cpu", "cuda"], default="cuda")
+    parser.add_argument(
+        "--ik-method",
+        type=str,
+        choices=["singular-value-decomposition", "pseudoinverse", "transpose", "damped-least-squares"],
+        default="damped-least-squares",
+    )
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--cube-x-min", type=float, default=0.42)
+    parser.add_argument("--cube-x-max", type=float, default=0.58)
+    parser.add_argument("--cube-y-min", type=float, default=-0.15)
+    parser.add_argument("--cube-y-max", type=float, default=0.15)
+    parser.add_argument("--min-cube-box-distance", type=float, default=0.34)
+    parser.add_argument("--place-approach-clearance", type=float, default=0.18)
+    parser.add_argument("--place-release-height", type=float, default=0.12)
+    parser.add_argument("--target-random-half-range", type=float, default=0.03)
+    parser.add_argument("--no-save-data", action="store_false", dest="save_data")
+    parser.set_defaults(save_data=True)
+    return parser.parse_args()
+
+
+args = parse_args()
+
+from isaacsim import SimulationApp
+
+simulation_app = SimulationApp({"headless": args.headless})
+
+import cv2
+import numpy as np
+from isaacsim.core.api import World
+from isaacsim.core.experimental.prims import RigidPrim
+from isaacsim.core.simulation_manager import SimulationManager
+from isaacsim.core.utils.prims import define_prim
+from isaacsim.core.utils.semantics import add_labels
+from isaacsim.core.utils.stage import add_reference_to_stage
+from isaacsim.robot.manipulators.examples.franka.franka_experimental import FrankaExperimental
+from isaacsim.sensors.camera import Camera
+from pxr import Gf, Usd, UsdGeom
+
+
+PHASE_NAMES = {
+    0: "move_above_cube",
+    1: "approach_cube",
+    2: "close_gripper",
+    3: "lift_cube",
+    4: "move_high_above_box",
+    5: "lower_straight_into_box",
+    6: "open_gripper",
+    7: "retract",
+}
+
+
+class LoadedFrontBoxFrankaPickPlace:
+    def __init__(self, robot: FrankaExperimental, cube: RigidPrim):
+        self.robot = robot
+        self.cube = cube
+        self.events_dt = [60, 40, 20, 40, 90, 55, 20, 25]
+        self._event = 0
+        self._step = 0
+        self.cube_size = np.array([0.0515, 0.0515, 0.0515])
+        self.cube_initial_orientation = np.array([1.0, 0.0, 0.0, 0.0])
+        self.target_position: np.ndarray | None = None
+        self.place_approach_position: np.ndarray | None = None
+        self.box_center_position: np.ndarray | None = None
+        self.box_inner_half_size: np.ndarray | None = None
+
+    def forward(self, ik_method: str) -> bool:
+        if self.is_done():
+            return False
+        goal_orientation = self.robot.get_downward_orientation()
+        if self._event == 0:
+            cube_pos = self.cube.get_world_poses()[0].numpy()
+            goal_position = np.array([cube_pos[0, 0], cube_pos[0, 1], cube_pos[0, 2] + 0.2])
+        elif self._event == 1:
+            cube_pos = self.cube.get_world_poses()[0].numpy()
+            goal_position = cube_pos + np.array([0.0, 0.0, 0.1])
+        elif self._event == 2:
+            self.robot.close_gripper()
+            goal_position = None
+        elif self._event == 3:
+            _, current_position, _ = self.robot.get_current_state()
+            goal_position = current_position + np.array([0.0, 0.0, 0.2])
+        elif self._event == 4:
+            goal_position = np.asarray(self.place_approach_position, dtype=float)
+        elif self._event == 5:
+            goal_position = np.asarray(self.target_position, dtype=float)
+        elif self._event == 6:
+            self.robot.open_gripper()
+            goal_position = None
+        elif self._event == 7:
+            goal_position = np.asarray(self.place_approach_position, dtype=float)
+        else:
+            goal_position = None
+
+        if goal_position is not None:
+            self.robot.set_end_effector_pose(
+                position=np.asarray(goal_position, dtype=float),
+                orientation=goal_orientation,
+                ik_method=ik_method,
+            )
+
+        self._step += 1
+        if self._step >= self.events_dt[self._event]:
+            self._event += 1
+            self._step = 0
+        return True
+
+    def is_done(self) -> bool:
+        return self._event >= len(self.events_dt)
+
+    def reset(self, cube_position: np.ndarray) -> None:
+        self.robot.reset_to_default_pose()
+        self.cube.set_world_poses(
+            positions=np.asarray(cube_position, dtype=float).reshape(1, -1),
+            orientations=self.cube_initial_orientation.reshape(1, -1),
+        )
+        self._event = 0
+        self._step = 0
+
+
+def as_array(value: Any) -> np.ndarray:
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return np.asarray(value, dtype=float)
+
+
+def world_bbox(stage: Usd.Stage, prim_path: str) -> tuple[np.ndarray, np.ndarray]:
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        raise RuntimeError(f"Missing prim: {prim_path}")
+    cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+    bbox = cache.ComputeWorldBound(prim).ComputeAlignedBox()
+    if bbox.IsEmpty():
+        raise RuntimeError(f"Empty bbox for prim: {prim_path}")
+    return np.array(bbox.GetMin(), dtype=float), np.array(bbox.GetMax(), dtype=float)
+
+
+def find_descendant(stage: Usd.Stage, root_path: str, basename: str) -> str | None:
+    root_prefix = root_path.rstrip("/") + "/"
+    for prim in stage.Traverse():
+        path = str(prim.GetPath())
+        if path.startswith(root_prefix) and path.rsplit("/", 1)[-1] == basename:
+            return path
+    return None
+
+
+def find_camera(stage: Usd.Stage, root_path: str, preferred_names: list[str]) -> str | None:
+    root_prefix = root_path.rstrip("/") + "/"
+    camera_paths = [
+        str(prim.GetPath())
+        for prim in stage.Traverse()
+        if prim.IsA(UsdGeom.Camera) and str(prim.GetPath()).startswith(root_prefix)
+    ]
+    for preferred_name in preferred_names:
+        for path in camera_paths:
+            if preferred_name in path.lower():
+                return path
+    return None
+
+
+def extract_mask(frame: dict[str, Any], transparent_label: str, debug: bool = False) -> np.ndarray | None:
+    """Extract semantic segmentation mask for transparent objects.
+
+    Returns None if:
+    - No semantic_segmentation data in frame
+    - transparent_label not found in idToLabels (object may be fully occluded)
+    """
+    seg_data = frame.get("semantic_segmentation")
+    if not isinstance(seg_data, dict) or "data" not in seg_data:
+        if debug:
+            print(f"  [DEBUG] No semantic_segmentation data in frame")
+        return None
+    seg_map = np.asarray(seg_data["data"])
+    transparent_ids: set[int] = set()
+    id_to_labels = seg_data.get("info", {}).get("idToLabels", {})
+
+    if debug:
+        print(f"  [DEBUG] idToLabels: {id_to_labels}")
+        print(f"  [DEBUG] seg_map unique values: {np.unique(seg_map)}")
+        print(f"  [DEBUG] seg_map shape: {seg_map.shape}")
+
+    for id_str, label_dict in id_to_labels.items():
+        if isinstance(label_dict, dict) and label_dict.get("class") == transparent_label:
+            transparent_ids.add(int(id_str))
+            if debug:
+                print(f"  [DEBUG] Found transparent label: id={id_str}, label={label_dict}")
+
+    if transparent_ids:
+        mask = np.zeros(seg_map.shape, dtype=np.uint16)
+        for transparent_id in transparent_ids:
+            mask[seg_map == transparent_id] = 1
+        if debug:
+            print(f"  [DEBUG] Created mask with {np.sum(mask > 0)} non-zero pixels")
+        return mask
+
+    # Object fully occluded or not visible - return None instead of invalid fallback mask
+    if debug:
+        print(f"  [DEBUG] No transparent_ids found in idToLabels - object likely occluded, returning None")
+    return None
+
+
+class FrankaMultiEnvCollector:
+    def __init__(self, world: World):
+        self.world = world
+        self.stage = world.stage
+        self.rng = np.random.default_rng(args.seed)
+        self.env_origins = np.zeros((args.num_envs, 3), dtype=float)
+        self.envs: list[dict[str, Any]] = []
+        self.controllers: list[LoadedFrontBoxFrankaPickPlace] = []
+        self.world_cameras: list[Camera] = []
+        self.wrist_cameras: list[Camera] = []
+        self.current_episode = 0
+        self.current_step = 0
+        self.mask_pixel_counts: list[int] = []
+        self.data_buffer = {
+            "joint_positions": [],
+            "joint_velocities": [],
+            "ee_positions": [],
+            "ee_orientations": [],
+            "target_positions": [],
+            "cube_positions": [],
+            "env_ids": [],
+            "step_ids": [],
+            "episode_ids": [],
+            "success": [],
+            "distances": [],
+        }
+
+    def setup_environments(self, env_usd: Path) -> None:
+        num_per_row = int(np.ceil(np.sqrt(args.num_envs)))
+        define_prim("/World/envs", "Xform")
+        for env_id in range(args.num_envs):
+            row = env_id // num_per_row
+            col = env_id % num_per_row
+            origin = np.array([col * args.env_spacing, row * args.env_spacing, 0.0], dtype=float)
+            self.env_origins[env_id] = origin
+            env_path = f"/World/envs/env_{env_id}"
+            env_prim = define_prim(env_path, "Xform")
+            UsdGeom.Xformable(env_prim).AddTranslateOp().Set(Gf.Vec3d(*origin))
+            add_reference_to_stage(str(env_usd), env_path)
+
+    def discover_env_prims(self) -> None:
+        for env_id in range(args.num_envs):
+            env_path = f"/World/envs/env_{env_id}"
+            robot_path = find_descendant(self.stage, env_path, "robot")
+            cube_path = find_descendant(self.stage, env_path, "Cube")
+            table_path = find_descendant(self.stage, env_path, "Table")
+            world_camera_path = find_camera(self.stage, env_path, ["world_camera", "leftobservationcamera", "left"])
+            wrist_camera_path = find_camera(self.stage, env_path, ["wrist_camera", "wrist"])
+            if not all([robot_path, cube_path, table_path, world_camera_path, wrist_camera_path]):
+                raise RuntimeError(
+                    f"Failed to discover env {env_id}: robot={robot_path}, cube={cube_path}, "
+                    f"table={table_path}, world_camera={world_camera_path}, wrist_camera={wrist_camera_path}"
+                )
+            self.envs.append(
+                {
+                    "env_id": env_id,
+                    "env_path": env_path,
+                    "origin": self.env_origins[env_id],
+                    "robot_path": robot_path,
+                    "cube_path": cube_path,
+                    "table_path": table_path,
+                    "world_camera_path": world_camera_path,
+                    "wrist_camera_path": wrist_camera_path,
+                    "box_bottom_path": f"{env_path}/Box/bottom",
+                    "box_left_path": f"{env_path}/Box/left",
+                    "box_right_path": f"{env_path}/Box/right",
+                    "box_front_path": f"{env_path}/Box/front",
+                    "box_back_path": f"{env_path}/Box/back",
+                }
+            )
+
+    def setup_semantic_labels(self) -> None:
+        for env in self.envs:
+            prim = self.stage.GetPrimAtPath(env["cube_path"])
+            if prim.IsValid():
+                add_labels(prim, labels=[args.transparent_label], instance_name="class")
+
+    def initialize_runtime_objects(self) -> None:
+        for env in self.envs:
+            robot = FrankaExperimental(robot_path=env["robot_path"], create_robot=False)
+            cube = RigidPrim(paths=env["cube_path"])
+            controller = LoadedFrontBoxFrankaPickPlace(robot=robot, cube=cube)
+            env_info = self.infer_environment(env)
+            controller.cube_size = env_info["cube_size"]
+            controller.box_inner_half_size = env_info["box_inner_half_size"]
+            env["info"] = env_info
+            env["robot"] = robot
+            env["cube"] = cube
+            self.controllers.append(controller)
+
+            self.world_cameras.append(
+                Camera(
+                    prim_path=env["world_camera_path"],
+                    name=f"world_camera_{env['env_id']}",
+                    resolution=(args.world_camera_width, args.world_camera_height),
+                )
+            )
+            self.wrist_cameras.append(
+                Camera(
+                    prim_path=env["wrist_camera_path"],
+                    name=f"wrist_camera_{env['env_id']}",
+                    resolution=(args.wrist_camera_width, args.wrist_camera_height),
+                )
+            )
+
+    def infer_environment(self, env: dict[str, Any]) -> dict[str, np.ndarray | float]:
+        table_min, table_max = world_bbox(self.stage, env["table_path"])
+        cube_min, cube_max = world_bbox(self.stage, env["cube_path"])
+        box_bottom_min, box_bottom_max = world_bbox(self.stage, env["box_bottom_path"])
+        box_left_min, box_left_max = world_bbox(self.stage, env["box_left_path"])
+        box_right_min, box_right_max = world_bbox(self.stage, env["box_right_path"])
+        box_front_min, box_front_max = world_bbox(self.stage, env["box_front_path"])
+        box_back_min, box_back_max = world_bbox(self.stage, env["box_back_path"])
+        inner_min_x = box_left_max[0]
+        inner_max_x = box_right_min[0]
+        inner_min_y = box_back_max[1]
+        inner_max_y = box_front_min[1]
+        box_center_xy = np.array([(box_bottom_min[0] + box_bottom_max[0]) / 2.0, (box_bottom_min[1] + box_bottom_max[1]) / 2.0])
+        return {
+            "tabletop_z": float(table_max[2]),
+            "cube_size": cube_max - cube_min,
+            "box_center_xy": box_center_xy,
+            "box_inner_half_size": np.array([(inner_max_x - inner_min_x) / 2.0, (inner_max_y - inner_min_y) / 2.0]),
+            "box_wall_top": float(max(box_left_max[2], box_right_max[2], box_front_max[2], box_back_max[2])),
+        }
+
+    def initialize_cameras_and_masks(self) -> None:
+        for camera in self.world_cameras + self.wrist_cameras:
+            camera.initialize()
+            camera.add_semantic_segmentation_to_frame()
+
+    def sample_scene_config(self, env: dict[str, Any]) -> dict[str, np.ndarray]:
+        info = env["info"]
+        cube_size = np.asarray(info["cube_size"], dtype=float)
+        tabletop_z = float(info["tabletop_z"])
+        box_center_xy = np.asarray(info["box_center_xy"], dtype=float)
+        inner_half = np.asarray(info["box_inner_half_size"], dtype=float)
+        origin = np.asarray(env["origin"], dtype=float)
+        for _ in range(100):
+            cube_xy = origin[:2] + np.array(
+                [
+                    self.rng.uniform(args.cube_x_min, args.cube_x_max),
+                    self.rng.uniform(args.cube_y_min, args.cube_y_max),
+                ]
+            )
+            if np.linalg.norm(cube_xy - box_center_xy) >= args.min_cube_box_distance:
+                break
+        else:
+            raise RuntimeError(f"Could not sample cube far enough from box in env {env['env_id']}")
+
+        target_margin = max(float(np.max(cube_size[:2])) * 0.75, 0.02)
+        target_half_range = min(args.target_random_half_range, max(0.0, float(np.min(inner_half) - target_margin)))
+        target_xy = box_center_xy + np.array(
+            [
+                self.rng.uniform(-target_half_range, target_half_range),
+                self.rng.uniform(-target_half_range, target_half_range),
+            ]
+        )
+        return {
+            "cube_initial_position": np.array([cube_xy[0], cube_xy[1], tabletop_z + cube_size[2] / 2.0]),
+            "target_position": np.array([target_xy[0], target_xy[1], tabletop_z + args.place_release_height]),
+            "place_approach_position": np.array([target_xy[0], target_xy[1], float(info["box_wall_top"]) + args.place_approach_clearance]),
+            "box_center_position": np.array([box_center_xy[0], box_center_xy[1], tabletop_z]),
+        }
+
+    def reset_episode(self) -> None:
+        self.current_episode += 1
+        self.current_step = 0
+        for env, controller in zip(self.envs, self.controllers):
+            scene_config = self.sample_scene_config(env)
+            env["scene_config"] = scene_config
+            controller.target_position = scene_config["target_position"]
+            controller.place_approach_position = scene_config["place_approach_position"]
+            controller.box_center_position = scene_config["box_center_position"]
+            controller.reset(scene_config["cube_initial_position"])
+        for _ in range(args.settle_steps):
+            self.world.step(render=True)
+        print(f"Episode {self.current_episode}: reset {args.num_envs} environments")
+
+    def capture_cameras(self, step: int = 0) -> tuple[list[Any], list[Any], list[Any], list[Any]]:
+        world_images, wrist_images, world_masks, wrist_masks = [], [], [], []
+        for env_id, (world_camera, wrist_camera) in enumerate(zip(self.world_cameras, self.wrist_cameras)):
+            world_rgba = np.asarray(world_camera.get_rgba(), dtype=np.uint8)
+            wrist_rgba = np.asarray(wrist_camera.get_rgba(), dtype=np.uint8)
+            world_images.append(world_rgba[:, :, :3] if world_rgba.ndim == 3 else None)
+            wrist_images.append(wrist_rgba[:, :, :3] if wrist_rgba.ndim == 3 else None)
+
+            # Only debug on first few steps
+            debug_enabled = step <= 3 or step % 10 == 0
+            if debug_enabled:
+                print(f"\n[Step {step}] Capturing cameras for env {env_id}:")
+
+            world_masks.append(extract_mask(world_camera.get_current_frame(), args.transparent_label, debug=debug_enabled))
+            wrist_masks.append(extract_mask(wrist_camera.get_current_frame(), args.transparent_label, debug=debug_enabled))
+        return world_images, wrist_images, world_masks, wrist_masks
+
+    def cube_is_inside_box(self, controller: LoadedFrontBoxFrankaPickPlace) -> bool:
+        cube_position, _ = controller.cube.get_world_poses()
+        cube_xy = as_array(cube_position).reshape(-1)[:2]
+        box_center = np.asarray(controller.box_center_position, dtype=float)
+        allowed_half = np.asarray(controller.box_inner_half_size, dtype=float) - np.max(controller.cube_size[:2]) / 2.0
+        return bool(np.all(np.abs(cube_xy - box_center[:2]) <= allowed_half))
+
+    def step(self, data_dir: Path) -> None:
+        self.current_step += 1
+        save_images = args.save_data and args.save_image_interval > 0 and self.current_step % args.save_image_interval == 0
+        if save_images:
+            world_images, wrist_images, world_masks, wrist_masks = self.capture_cameras(self.current_step)
+        else:
+            world_images = wrist_images = world_masks = wrist_masks = None
+
+        for env_id, (env, controller) in enumerate(zip(self.envs, self.controllers)):
+            if not controller.is_done():
+                controller.forward(args.ik_method)
+
+            dof_positions, ee_position, ee_orientation = controller.robot.get_current_state()
+            try:
+                joint_velocities = controller.robot.get_dof_velocities().numpy()
+            except Exception:
+                joint_velocities = np.zeros_like(dof_positions)
+            cube_position, _ = controller.cube.get_world_poses()
+            scene_config = env["scene_config"]
+            distance = float(np.linalg.norm(as_array(ee_position).reshape(-1)[:3] - scene_config["target_position"]))
+            success = controller.is_done() and self.cube_is_inside_box(controller)
+
+            if args.save_data and save_images:
+                self.data_buffer["joint_positions"].append(as_array(dof_positions).reshape(-1))
+                self.data_buffer["joint_velocities"].append(as_array(joint_velocities).reshape(-1))
+                self.data_buffer["ee_positions"].append(as_array(ee_position).reshape(-1)[:3])
+                self.data_buffer["ee_orientations"].append(as_array(ee_orientation).reshape(-1)[:4])
+                self.data_buffer["target_positions"].append(scene_config["target_position"])
+                self.data_buffer["cube_positions"].append(as_array(cube_position).reshape(-1)[:3])
+                self.data_buffer["env_ids"].append(env_id)
+                self.data_buffer["step_ids"].append(self.current_step)
+                self.data_buffer["episode_ids"].append(self.current_episode)
+                self.data_buffer["success"].append(success)
+                self.data_buffer["distances"].append(distance)
+
+                stem = f"ep{self.current_episode:03d}_env{env_id}_step{self.current_step:04d}"
+                if world_images and world_images[env_id] is not None:
+                    np.save(data_dir / "world_camera" / f"{stem}.npy", world_images[env_id])
+                if wrist_images and wrist_images[env_id] is not None:
+                    np.save(data_dir / "wrist_camera" / f"{stem}.npy", wrist_images[env_id])
+                if world_masks and world_masks[env_id] is not None:
+                    np.save(data_dir / "world_camera_mask" / f"{stem}.npy", world_masks[env_id])
+                    self.mask_pixel_counts.append(int(np.sum(world_masks[env_id] > 0)))
+                if wrist_masks and wrist_masks[env_id] is not None:
+                    np.save(data_dir / "wrist_camera_mask" / f"{stem}.npy", wrist_masks[env_id])
+
+    def save_episode_data(self, data_dir: Path) -> None:
+        if not args.save_data or not self.data_buffer["joint_positions"]:
+            return
+        np.savez(
+            data_dir / f"episode_{self.current_episode:03d}.npz",
+            joint_positions=np.asarray(self.data_buffer["joint_positions"]),
+            joint_velocities=np.asarray(self.data_buffer["joint_velocities"]),
+            ee_positions=np.asarray(self.data_buffer["ee_positions"]),
+            ee_orientations=np.asarray(self.data_buffer["ee_orientations"]),
+            target_positions=np.asarray(self.data_buffer["target_positions"]),
+            cube_positions=np.asarray(self.data_buffer["cube_positions"]),
+            env_ids=np.asarray(self.data_buffer["env_ids"]),
+            step_ids=np.asarray(self.data_buffer["step_ids"]),
+            episode_ids=np.asarray(self.data_buffer["episode_ids"]),
+            success=np.asarray(self.data_buffer["success"]),
+            distances=np.asarray(self.data_buffer["distances"]),
+        )
+        success_rate = float(np.mean(np.asarray(self.data_buffer["success"], dtype=bool))) * 100.0
+        avg_mask_pixels = float(np.mean(self.mask_pixel_counts)) if self.mask_pixel_counts else 0.0
+        print(
+            f"Saved episode {self.current_episode:03d}: {len(self.data_buffer['joint_positions'])} samples, "
+            f"success_samples={success_rate:.1f}%, avg_world_mask_pixels={avg_mask_pixels:.1f}"
+        )
+        for key in self.data_buffer:
+            self.data_buffer[key] = []
+        self.mask_pixel_counts.clear()
+
+    def all_done(self) -> bool:
+        return all(controller.is_done() for controller in self.controllers)
+
+
+def prepare_data_dir() -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = args.run_name or f"franka_front_box_multi_env_{timestamp}"
+    data_dir = (args.output_dir / run_name).resolve()
+    if args.save_data:
+        for subdir in ["world_camera", "wrist_camera", "world_camera_mask", "wrist_camera_mask"]:
+            (data_dir / subdir).mkdir(parents=True, exist_ok=True)
+    return data_dir
+
+
+def write_config(data_dir: Path) -> None:
+    if not args.save_data:
+        return
+    config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
+    config["env_usd"] = str(args.env_usd.resolve())
+    config["output_dir"] = str(args.output_dir.resolve())
+    config["data_format"] = {
+        "episode_npz": "episode_###.npz with joint_positions, joint_velocities, ee_positions, ee_orientations, target_positions, cube_positions, env_ids, step_ids, episode_ids, success, distances",
+        "world_camera": "world_camera/ep###_env#_step####.npy, RGB uint8 HxWx3",
+        "wrist_camera": "wrist_camera/ep###_env#_step####.npy, RGB uint8 HxWx3",
+        "world_camera_mask": "world_camera_mask/ep###_env#_step####.npy, uint16 HxW, 0=background, 1=transparent cube",
+        "wrist_camera_mask": "wrist_camera_mask/ep###_env#_step####.npy, uint16 HxW, 0=background, 1=transparent cube",
+    }
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "collection_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
+def main() -> int:
+    env_usd = args.env_usd.resolve()
+    if not env_usd.exists():
+        raise FileNotFoundError(f"Environment USD not found: {env_usd}")
+    data_dir = prepare_data_dir()
+    write_config(data_dir)
+    print("=" * 72)
+    print("Franka front-box multi-env camera data collection")
+    print(f"  env_usd: {env_usd}")
+    print(f"  num_envs: {args.num_envs}, episodes: {args.episodes}, steps_per_episode: {args.steps_per_episode}")
+    print(f"  data_dir: {data_dir}")
+    print("=" * 72)
+
+    SimulationManager.set_physics_sim_device(args.device)
+    world = World(stage_units_in_meters=1.0)
+    collector = FrankaMultiEnvCollector(world)
+    collector.setup_environments(env_usd)
+    for _ in range(5):
+        simulation_app.update()
+    collector.discover_env_prims()
+    collector.setup_semantic_labels()
+    collector.initialize_runtime_objects()
+
+    world.reset()
+    world.play()
+    collector.initialize_cameras_and_masks()
+    for _ in range(3):
+        world.step(render=True)
+
+    try:
+        for _ in range(args.episodes):
+            collector.reset_episode()
+            for _step_index in range(args.steps_per_episode):
+                world.step(render=True)
+                if world.is_playing():
+                    collector.step(data_dir)
+                if collector.all_done():
+                    break
+                if collector.current_step % 50 == 0:
+                    done_count = sum(controller.is_done() for controller in collector.controllers)
+                    print(f"Episode {collector.current_episode} step {collector.current_step}: done {done_count}/{args.num_envs}")
+            collector.save_episode_data(data_dir)
+    except KeyboardInterrupt:
+        print("Interrupted by user")
+        collector.save_episode_data(data_dir)
+
+    print("Collection completed")
+    print(f"Data saved to: {data_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    exit_code = 1
+    try:
+        exit_code = main()
+    finally:
+        simulation_app.close()
+    raise SystemExit(exit_code)

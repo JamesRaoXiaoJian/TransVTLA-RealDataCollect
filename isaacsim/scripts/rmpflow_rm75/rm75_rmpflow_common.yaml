@@ -1,0 +1,91 @@
+# RM75 common RMPFlow configuration
+
+joint_limit_buffers: [.01, .01, .01, .01, .01, .01, .01]
+rmp_params:
+    cspace_target_rmp:
+        metric_scalar: 40.
+        position_gain: 80.
+        damping_gain: 40.
+        robust_position_term_thresh: .5
+        inertia: 1.
+    cspace_trajectory_rmp:
+        p_gain: 80.
+        d_gain: 8.
+        ff_gain: .2
+        weight: 40.
+    cspace_affine_rmp:
+        final_handover_time_std_dev: .25
+        weight: 1500.
+    joint_limit_rmp:
+        metric_scalar: 800.
+        metric_length_scale: .02
+        metric_exploder_eps: 1e-3
+        metric_velocity_gate_length_scale: .02
+        accel_damper_gain: 180.
+        accel_potential_gain: 1.
+        accel_potential_exploder_length_scale: .1
+        accel_potential_exploder_eps: 1e-2
+    joint_velocity_cap_rmp:
+        max_velocity: 1.0
+        velocity_damping_region: .35
+        damping_gain: 800.0
+        metric_weight: 80.
+    target_rmp:
+        accel_p_gain: 30.
+        accel_d_gain: 85.
+        accel_norm_eps: .075
+        metric_alpha_length_scale: .05
+        min_metric_alpha: .01
+        max_metric_scalar: 8000
+        min_metric_scalar: 2000
+        proximity_metric_boost_scalar: 20.
+        proximity_metric_boost_length_scale: .02
+        xi_estimator_gate_std_dev: 20000.
+        accept_user_weights: false
+    axis_target_rmp:
+        accel_p_gain: 210.
+        accel_d_gain: 60.
+        metric_scalar: 10
+        proximity_metric_boost_scalar: 2500.
+        proximity_metric_boost_length_scale: .08
+        xi_estimator_gate_std_dev: 20000.
+        accept_user_weights: false
+    collision_rmp:
+        damping_gain: 40.
+        damping_std_dev: .05
+        damping_robustness_eps: 1e-2
+        damping_velocity_gate_length_scale: .02
+        repulsion_gain: 600.
+        repulsion_std_dev: .02
+        metric_modulation_radius: .4
+        metric_scalar: 8000.
+        metric_exploder_std_dev: .03
+        metric_exploder_eps: .001
+    damping_rmp:
+        accel_d_gain: 25.
+        metric_scalar: 40.
+        inertia: 80.
+canonical_resolve:
+    max_acceleration_norm: 40.
+    projection_tolerance: .01
+    verbose: false
+body_cylinders:
+    - name: base_link
+      pt1: [0.0, 0.0, 0.0]
+      pt2: [0.0, 0.0, 0.15]
+      radius: 0.12
+    - name: link_2
+      pt1: [0.0, 0.0, 0.15]
+      pt2: [0.0, 0.0, 0.4]
+      radius: 0.09
+    - name: link_4
+      pt1: [0.0, 0.0, 0.4]
+      pt2: [0.0, 0.0, 0.65]
+      radius: 0.08
+    - name: link_6
+      pt1: [0.0, 0.0, 0.65]
+      pt2: [0.0, 0.0, 0.85]
+      radius: 0.07
+body_collision_controllers:
+    - name: camera_link
+      radius: .05
