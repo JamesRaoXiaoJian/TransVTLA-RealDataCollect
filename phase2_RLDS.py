@@ -5,8 +5,8 @@ import os
 import sys
 import cv2
 from pathlib import Path
-from typing import Iterator, Dict, Any, Tuple
-from session_schema import common_frame_stems, resolve_session_layout, rgb_path
+from typing import Iterator, Dict, Any, Optional, Tuple
+from session_schema import common_frame_stems, depth_path, resolve_session_layout, rgb_path
 
 # [核心修复] 强制该脚本仅使用 CPU，避免卡在 GPU 驱动注册环节
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -18,19 +18,22 @@ _DESCRIPTION = """
 RM75 真实数据转换脚本 - 已修复与仿真数据的兼容性问题。
 1. 图像强制缩放为 224x224。
 2. State 降维至 7 维 (6D Pose + 1D Gripper)。
-3. 增加了处理进度打印，防止运行“假死”。
+3. 增加两路 RealSense 标准 uint16 毫米深度图。
 """
+
+DEPTH_IMAGE_SHAPE = (224, 224, 1)
 
 class LocalRobotData(tfds.core.GeneratorBasedBuilder):
     """瑞尔曼机械臂真机数据集转换器 (标准兼容版)"""
 
-    VERSION = tfds.core.Version('1.7.0')
+    VERSION = tfds.core.Version('1.8.0')
     RELEASE_NOTES = {
         '1.7.0': '修正图像 Shape 为 (224,224,3)，State 降维至 7 维，增加运行进度反馈。',
+        '1.8.0': '加入两路 RealSense 标准 uint16 毫米深度图。',
     }
 
     def _info(self) -> tfds.core.DatasetInfo:
-        """定义严格兼容 OpenVLA 的特征结构"""
+        """定义 RGB-D 版 OpenVLA/RLDS 特征结构。"""
         return tfds.core.DatasetInfo(
             builder=self,
             description=_DESCRIPTION,
@@ -42,6 +45,14 @@ class LocalRobotData(tfds.core.GeneratorBasedBuilder):
                         ),
                         'wrist_image': tfds.features.Image(
                             shape=(224, 224, 3), dtype=np.uint8, doc='RealSense 腕部视角'
+                        ),
+                        'primary_depth': tfds.features.Tensor(
+                            shape=DEPTH_IMAGE_SHAPE, dtype=np.uint16,
+                            doc='World RealSense depth, uint16 millimeters, aligned to color'
+                        ),
+                        'wrist_depth': tfds.features.Tensor(
+                            shape=DEPTH_IMAGE_SHAPE, dtype=np.uint16,
+                            doc='Wrist RealSense depth, uint16 millimeters, aligned to color'
                         ),
                         'state': tfds.features.Tensor(
                             shape=(7,), dtype=np.float32, doc='6位姿 + 1夹爪'
@@ -106,6 +117,8 @@ class LocalRobotData(tfds.core.GeneratorBasedBuilder):
                     r_img_path = rgb_path(layout.wrist, frame_id)
                     
                     if not d_img_path.exists() or not r_img_path.exists(): continue
+                    d_depth_path = depth_path(layout.world, frame_id)
+                    r_depth_path = depth_path(layout.wrist, frame_id)
                         
                     inner = data.get("state", {}).get("data", {})
                     pose = np.array(inner.get("pose", []), dtype=np.float32)
@@ -118,16 +131,33 @@ class LocalRobotData(tfds.core.GeneratorBasedBuilder):
                         if img is None: return None
                         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                         return cv2.resize(img, (224, 224), interpolation=cv2.INTER_AREA)
-                    
+
+                    def process_depth(p: Optional[Path]) -> np.ndarray:
+                        if p is None or not p.exists():
+                            return np.zeros(DEPTH_IMAGE_SHAPE, dtype=np.uint16)
+                        depth = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+                        if depth is None:
+                            return np.zeros(DEPTH_IMAGE_SHAPE, dtype=np.uint16)
+                        if depth.ndim == 3:
+                            depth = depth[:, :, 0]
+                        if depth.dtype != np.uint16:
+                            depth = depth.astype(np.uint16)
+                        depth = cv2.resize(depth, (224, 224), interpolation=cv2.INTER_NEAREST)
+                        return depth[:, :, None]
+
                     p_img = process_img(d_img_path)
                     w_img = process_img(r_img_path)
-                    
+                    p_depth = process_depth(d_depth_path)
+                    w_depth = process_depth(r_depth_path)
+
                     if p_img is None or w_img is None: continue
-                        
+
                     steps_raw.append({
                         "pose": pose,
                         "primary_image": p_img,
-                        "wrist_image": w_img
+                        "wrist_image": w_img,
+                        "primary_depth": p_depth,
+                        "wrist_depth": w_depth,
                     })
                 except Exception as e:
                     # 打印具体错误，防止静默失败
@@ -154,6 +184,8 @@ class LocalRobotData(tfds.core.GeneratorBasedBuilder):
                     'observation': {
                         'primary_image': curr["primary_image"],
                         'wrist_image': curr["wrist_image"],
+                        'primary_depth': curr["primary_depth"],
+                        'wrist_depth': curr["wrist_depth"],
                         'state': state_vec,
                     },
                     'action': action_vec,

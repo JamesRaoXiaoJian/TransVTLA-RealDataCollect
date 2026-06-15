@@ -36,7 +36,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import cv2
 import numpy as np
 import tensorflow_datasets as tfds
-from session_schema import common_frame_stems, resolve_session_layout, rgb_path
+from session_schema import common_frame_stems, depth_path, resolve_session_layout, rgb_path
 
 # ============================================================
 # 采样率常量
@@ -195,15 +195,16 @@ TransVTLA Phase2 真机数据集 (RLDS 格式)。
 - 包含物体属性字段用于提示词注入
 """
 
-_VERSION = tfds.core.Version("2.0.0")
+DEPTH_IMAGE_SHAPE = (224, 224, 1)
 
 
 class Phase2RobotData(tfds.core.GeneratorBasedBuilder):
     """Phase2 真机数据集 RLDS 转换器。"""
 
-    VERSION = _VERSION
+    VERSION = tfds.core.Version("2.1.0")
     RELEASE_NOTES = {
         "2.0.0": "Phase2: 加入触觉数据 + 物体属性提示词注入。",
+        "2.1.0": "加入两路 RealSense 标准 uint16 毫米深度图。",
     }
 
     def __init__(self, data_dir=None, source_root=None, **kwargs):
@@ -229,6 +230,14 @@ class Phase2RobotData(tfds.core.GeneratorBasedBuilder):
                         ),
                         "wrist_image": tfds.features.Image(
                             shape=(224, 224, 3), dtype=np.uint8, doc="RealSense 腕部视角"
+                        ),
+                        "primary_depth": tfds.features.Tensor(
+                            shape=DEPTH_IMAGE_SHAPE, dtype=np.uint16,
+                            doc="World RealSense depth, uint16 millimeters, aligned to color"
+                        ),
+                        "wrist_depth": tfds.features.Tensor(
+                            shape=DEPTH_IMAGE_SHAPE, dtype=np.uint16,
+                            doc="Wrist RealSense depth, uint16 millimeters, aligned to color"
                         ),
                         "state": tfds.features.Tensor(
                             shape=(7,), dtype=np.float32, doc="6D Pose + 1D Gripper"
@@ -419,6 +428,8 @@ class Phase2RobotData(tfds.core.GeneratorBasedBuilder):
             w_img = self._load_image(rgb_path(layout.wrist, stem))
             if p_img is None or w_img is None:
                 continue
+            p_depth = self._load_depth(depth_path(layout.world, stem))
+            w_depth = self._load_depth(depth_path(layout.wrist, stem))
 
             # 机械臂状态: 6D pose + 1D gripper (暂填 0)
             state_vec = np.concatenate([aligned_poses[i], [0.0]]).astype(np.float32)
@@ -440,6 +451,8 @@ class Phase2RobotData(tfds.core.GeneratorBasedBuilder):
                 "observation": {
                     "primary_image": p_img,
                     "wrist_image": w_img,
+                    "primary_depth": p_depth,
+                    "wrist_depth": w_depth,
                     "state": state_vec,
                     "tactile": tactile_frame,
                 },
@@ -470,6 +483,21 @@ class Phase2RobotData(tfds.core.GeneratorBasedBuilder):
             return None
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return cv2.resize(img, (224, 224), interpolation=cv2.INTER_AREA)
+
+    # ----------------------------------------------------------
+    @staticmethod
+    def _load_depth(path: Optional[Path]) -> np.ndarray:
+        if path is None or not path.exists():
+            return np.zeros(DEPTH_IMAGE_SHAPE, dtype=np.uint16)
+        depth = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            return np.zeros(DEPTH_IMAGE_SHAPE, dtype=np.uint16)
+        if depth.ndim == 3:
+            depth = depth[:, :, 0]
+        if depth.dtype != np.uint16:
+            depth = depth.astype(np.uint16)
+        depth = cv2.resize(depth, (224, 224), interpolation=cv2.INTER_NEAREST)
+        return depth[:, :, None]
 
 
 # ============================================================

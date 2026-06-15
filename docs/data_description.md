@@ -25,15 +25,16 @@ sessions/
 │       │   │   ├── 0001.jpg
 │       │   │   └── ...
 │       │   └── depth/
-│       │       ├── 0001.png               # 16-bit 深度图
+│       │       ├── 0001.png               # uint16 毫米深度图，对齐 rgb
 │       │       └── ...
 │       ├── wrist_camera/                  # wrist RealSense RGB-D
 │       │   ├── rgb/
 │       │   │   ├── 0001.jpg
 │       │   │   └── ...
 │       │   └── depth/
-│       │       ├── 0001.png               # 16-bit 深度图
+│       │       ├── 0001.png               # uint16 毫米深度图，对齐 rgb
 │       │       └── ...
+│       ├── camera_metadata.json           # 两台 RealSense 的 profile / 内参 / depth scale
 │       └── robot_state/                   # 机械臂与夹爪状态
 │           ├── robot_state.csv            # 机械臂关节与末端位姿
 │           └── gripper_state.csv          # 可选，夹爪 RM Plus 实时状态
@@ -111,13 +112,24 @@ gripper_pos = dist["pos"][0]
 
 ### 4. 相机图像 — `world_camera/` & `wrist_camera/`
 
+- 标准采集 profile：`848x480@30`
 - RGB 格式：JPEG（`rgb/XXXX.jpg`，四位序号）
-- 深度格式：16-bit PNG（`depth/XXXX.png`，四位序号）
+- 深度格式：uint16 PNG（`depth/XXXX.png`，四位序号），单位为毫米，已对齐到 RGB/color 像素
 - `world_camera`：固定外部 RealSense 主视角
 - `wrist_camera`：腕部 RealSense 视角
 - 目标采样率：20 Hz
+- `camera_metadata.json`：保存每台相机的 RealSense SDK 内参、distortion、depth scale、序列号和深度保存单位
 
 旧版数据使用 `dji/` 作为 world RGB、`realsense_rgb/` 作为 wrist RGB、`realsense_depth/` 作为 wrist depth。当前回放、标注和转换脚本兼容旧格式。
+
+RLDS/TFDS 转换输出中，图像字段保持 `primary_image` / `wrist_image`，深度字段为：
+
+| 字段 | 形状 | 类型 | 说明 |
+|------|------|------|------|
+| `primary_depth` | `(224, 224, 1)` | `uint16` | world depth，单位毫米，对齐 `primary_image` |
+| `wrist_depth` | `(224, 224, 1)` | `uint16` | wrist depth，单位毫米，对齐 `wrist_image` |
+
+转换时深度图使用最近邻缩放，避免插值改变毫米深度值。旧版 DJI world 数据没有 world depth 时，`primary_depth` 填零。
 
 ## 触觉数据预处理
 

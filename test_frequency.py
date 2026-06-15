@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 # 强制 CPU，避免 GPU 初始化卡顿
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
+from realsense_standard import STANDARD_RS_FPS, STANDARD_RS_HEIGHT, STANDARD_RS_WIDTH
+
 TEST_ARGS: argparse.Namespace | None = None
 
 # ============================================================
@@ -329,9 +331,9 @@ def _current_args() -> argparse.Namespace:
     return argparse.Namespace(
         world_serial=None,
         wrist_serial=None,
-        width=848,
-        height=480,
-        rs_fps=30,
+        width=STANDARD_RS_WIDTH,
+        height=STANDARD_RS_HEIGHT,
+        rs_fps=STANDARD_RS_FPS,
     )
 
 
@@ -618,9 +620,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--world-serial", default=None, help="world RealSense 序列号")
     parser.add_argument("--wrist-serial", default=None, help="wrist RealSense 序列号")
-    parser.add_argument("--width", type=int, default=848, help="RealSense RGB/depth 宽度")
-    parser.add_argument("--height", type=int, default=480, help="RealSense RGB/depth 高度")
-    parser.add_argument("--rs-fps", type=int, default=30, help="RealSense 设备采集 FPS")
+    parser.add_argument("--width", type=int, default=STANDARD_RS_WIDTH, help="RealSense RGB/depth 标准宽度")
+    parser.add_argument("--height", type=int, default=STANDARD_RS_HEIGHT, help="RealSense RGB/depth 标准高度")
+    parser.add_argument("--rs-fps", type=int, default=STANDARD_RS_FPS, help="RealSense 标准采集 FPS")
     return parser.parse_args()
 
 

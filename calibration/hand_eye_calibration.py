@@ -28,6 +28,7 @@ import cv2
 import pyrealsense2 as rs
 import json
 import time
+from realsense_standard import STANDARD_RS_FPS, STANDARD_RS_HEIGHT, STANDARD_RS_WIDTH
 
 # ================================================================
 # 标定板参数
@@ -41,9 +42,9 @@ CHECKERBOARD_3D *= SQUARE_SIZE
 # ================================================================
 # 采集分辨率（与 collect_data.py 一致）
 # ================================================================
-RS_WIDTH = 1280
-RS_HEIGHT = 720
-RS_FPS = 30
+RS_WIDTH = STANDARD_RS_WIDTH
+RS_HEIGHT = STANDARD_RS_HEIGHT
+RS_FPS = STANDARD_RS_FPS
 
 # ================================================================
 # 机器人连接
@@ -138,7 +139,7 @@ def pose_to_matrix(rvec, tvec):
 # ================================================================
 # 实时采集
 # ================================================================
-def collect_data(robot_api, save_path=RECORD_FILE):
+def collect_data(robot_api, save_path=RECORD_FILE, serial: str | None = None):
     """实时采集手眼标定数据（RealSense + 机械臂）"""
 
     # ── 图片保存目录 ──
@@ -148,7 +149,10 @@ def collect_data(robot_api, save_path=RECORD_FILE):
     # ── 启动 RealSense ──
     pipeline = rs.pipeline()
     config = rs.config()
+    if serial:
+        config.enable_device(serial)
     config.enable_stream(rs.stream.color, RS_WIDTH, RS_HEIGHT, rs.format.bgr8, RS_FPS)
+    config.enable_stream(rs.stream.depth, RS_WIDTH, RS_HEIGHT, rs.format.z16, RS_FPS)
     profile = pipeline.start(config)
 
     # 读取内参
@@ -248,6 +252,7 @@ def collect_data(robot_api, save_path=RECORD_FILE):
             # 保存数据（含图片路径列表）
             data = {
                 "resolution": {"width": RS_WIDTH, "height": RS_HEIGHT},
+                "serial": serial,
                 "T_base_ee_list": [m.tolist() for m in T_base_ee_list],
                 "T_cam_target_list": [m.tolist() for m in T_cam_target_list],
                 "camera_matrix": camera_matrix.tolist(),
@@ -419,7 +424,7 @@ def compute_reprojection_error(T_base_ee_list, T_cam_target_list, T_ee_cam):
 # ================================================================
 # 导出为 camera.py 格式
 # ================================================================
-def export_to_camera_config(T_ee_cam, T_base_ee_sample):
+def export_to_camera_config(T_ee_cam, T_base_ee_sample, camera_matrix=None):
     """
     导出 camera.py 的 R/t 格式
     R = R_cam_to_world（相机旋转到世界/基座坐标系）
@@ -437,8 +442,12 @@ def export_to_camera_config(T_ee_cam, T_base_ee_sample):
     print(f"{'='*60}")
     print(f'    "wrist_camera": CameraParams(')
     print(f"        K=torch.tensor([  # {RS_WIDTH}x{RS_HEIGHT}")
-    print(f"            [fx, 0.0, cx],")
-    print(f"            [0.0, fy, cy],")
+    if camera_matrix is None:
+        print(f"            [fx, 0.0, cx],")
+        print(f"            [0.0, fy, cy],")
+    else:
+        print(f"            [{camera_matrix[0,0]:.8f}, 0.0, {camera_matrix[0,2]:.8f}],")
+        print(f"            [0.0, {camera_matrix[1,1]:.8f}, {camera_matrix[1,2]:.8f}],")
     print(f"            [0.0, 0.0, 1.0]")
     print(f"        ], dtype=torch.float32),")
     print(f"        R=torch.tensor([")
@@ -464,6 +473,7 @@ def main():
                         help='数据文件路径')
     parser.add_argument('--ip', type=str, default=ROBOT_IP, help='机械臂 IP')
     parser.add_argument('--port', type=int, default=ROBOT_PORT, help='机械臂端口')
+    parser.add_argument('--serial', type=str, default=None, help='wrist RealSense serial number')
     args = parser.parse_args()
 
     if args.mode == 'live':
@@ -471,7 +481,7 @@ def main():
         robot_api = RobotArmAPI(ip=args.ip, port=args.port)
 
         T_base_ee_list, T_cam_target_list, camera_matrix, dist_coeffs = collect_data(
-            robot_api=robot_api, save_path=args.data
+            robot_api=robot_api, save_path=args.data, serial=args.serial
         )
         robot_api.disconnect()
 
@@ -499,7 +509,7 @@ def main():
     print(f"  T_base_cam = T_base_ee_current @ T_ee_cam")
     print(f"  其中 T_ee_cam 是标定结果（固定不变）")
 
-    export_to_camera_config(T_ee_cam, T_base_ee_list[0])
+    export_to_camera_config(T_ee_cam, T_base_ee_list[0], camera_matrix)
 
 
 if __name__ == "__main__":

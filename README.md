@@ -16,6 +16,9 @@
 - `collect_data.py`：多模态数据采集主程序（双 RealSense RGB-D + 机械臂 + 压力 + 夹爪），PySide6 界面。
 - `test_frequency.py`：逐项测试压力、机械臂、夹爪和双 RealSense 的采集频率。
 - `data_viwer.py`：离线浏览已采集 session 的工具。
+- `calibration/world_realsense_calibration.py`：固定 world RealSense 相机到机械臂基座的外参标定。
+- `calibration/hand_eye_calibration.py`：wrist RealSense 手眼标定，读取标准 profile 下的 SDK 内参。
+- `Phase2_build_RLDSdata.py`：把采集 session 转换为 RGB-D RLDS/TFDS 数据。
 - `keybordControl.py`：键盘控制机械臂并记录位姿。
 - `connect_robot.py`：快速连接机械臂并打印当前状态。
 
@@ -46,6 +49,7 @@ sessions/
 		wrist_camera/
 			rgb/
 			depth/
+		camera_metadata.json
 		robot_state/
 		pressure/
 ```
@@ -53,13 +57,16 @@ sessions/
 不同脚本保存的内容略有差异：
 
 - `world_camera/rgb/`：world RealSense RGB 图像帧。
-- `world_camera/depth/`：world RealSense 深度图，16-bit PNG。
+- `world_camera/depth/`：world RealSense 深度图，uint16 PNG，单位毫米，已对齐 RGB。
 - `wrist_camera/rgb/`：wrist RealSense RGB 图像帧。
-- `wrist_camera/depth/`：wrist RealSense 深度图，16-bit PNG。
+- `wrist_camera/depth/`：wrist RealSense 深度图，uint16 PNG，单位毫米，已对齐 RGB。
+- `camera_metadata.json`：两台 RealSense 的 `848x480@30` profile、SDK 内参、畸变、序列号和 depth scale。
 - `robot_state/`：机械臂状态 JSON。
 - `pressure/`：压力数据 CSV。
 
 旧版 `dji/` + `realsense_rgb/` + `realsense_depth/` 会话仍可由回放、标注和转换脚本读取。
+
+RLDS/TFDS 转换会输出 `primary_image`、`wrist_image`、`primary_depth`、`wrist_depth`。两路深度为 `uint16`，形状 `224x224x1`，单位毫米。
 
 ## 脚本说明与用法
 
@@ -96,8 +103,8 @@ python collect_data.py --arm-host 172.25.5.243 --arm-port 8080 \
 
 - `--world-serial`：world RealSense 序列号；不填时会从已连接设备自动选择。
 - `--wrist-serial`：wrist RealSense 序列号；不填时会从已连接设备自动选择。
-- `--width` / `--height`：RGB 和深度流分辨率，默认 `848x480`。
-- `--rs-fps`：RealSense 设备采集 FPS，默认 `30`。
+- `--width` / `--height`：RGB 和深度流标准分辨率，默认 `848x480`。
+- `--rs-fps`：RealSense 设备标准采集 FPS，默认 `30`。
 - `--disable-gripper`：关闭夹爪状态采集。
 
 ### `data_viwer.py`

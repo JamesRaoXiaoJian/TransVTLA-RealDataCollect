@@ -49,8 +49,9 @@ CAMERA_CONFIGS = {
         ], dtype=torch.float32),
         t=torch.tensor([0.8545415959817313, 0.5748472977587156, 1.0411478820663598], dtype=torch.float32)
     ),
-    # RealSense D455 腕部相机 (1280x720)，eye-on-hand
-    # K: RealSense SDK 直读（fx=912.02, fy=911.63, cx=642.71, cy=370.44）
+    # Wrist RealSense 腕部相机（eye-on-hand）。
+    # 注意：下面是旧 1280x720 SDK 内参和旧手眼结果。标准双 RealSense 采集使用
+    # 848x480@30，必须用 calibration/hand_eye_calibration.py 重新导出的 K/R/t 替换。
     # R/t: 手眼标定结果（TSAI 方法，平均旋转误差 1.78°，平移误差 6.1mm）
     # 注意：eye-on-hand 的 R/t 随机械臂运动变化，此处为标定时刻的 T_base_cam
     # 实际使用时需实时计算：T_base_cam = T_base_ee_current @ T_ee_cam
@@ -67,10 +68,10 @@ CAMERA_CONFIGS = {
         ], dtype=torch.float32),
         t=torch.tensor([0.42140274, 0.04006448, 0.38033282], dtype=torch.float32)
     ),
-    # DJI Action 5 Pro (1280x720)，标定于 1920x1080 后按比例缩放
-    # scale = 1280/1920 = 2/3,  720/1080 = 2/3
-    # 位置：基座坐标 (0.133, 0.58, 0.32) m，朝向：-Y（从左向右看）
-    # R 列向量：x_cam=-X_world, y_cam=-Z_world, z_cam=-Y_world
+    # World RealSense 固定相机（eye-to-hand）。
+    # 注意：下面仍是旧 DJI world camera 占位参数，切换到双 RealSense 后必须用
+    # calibration/world_realsense_calibration.py 导出的 CameraParams 替换。
+    # R/t 约定：T_base_cam；R 为相机坐标轴在机器人基座坐标系中的方向，t 为相机位置。
     "world_camera": CameraParams(
         K=torch.tensor([
             [553.635449, 0.0, 632.236057],

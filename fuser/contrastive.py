@@ -136,7 +136,7 @@ def project_3d_to_2d_672_wrist_camera(
     K: torch.Tensor,
     R: torch.Tensor,
     t: torch.Tensor,
-    image_size_orig: tuple = (720, 1280),  # RealSense D455 采集分辨率
+    image_size_orig: tuple = (480, 848),  # standard RealSense collection resolution
     image_size_resize: tuple = (672, 672),
     vision_strides: dict = {"patch_stride": 14, "conv_stride": 2},
 ):
@@ -180,7 +180,7 @@ def project_3d_to_2d_672_world_camera(
     K: torch.Tensor,
     R: torch.Tensor,
     t: torch.Tensor,
-    image_size_orig: tuple = (720, 1280),  # DJI Action 5 Pro 采集分辨率
+    image_size_orig: tuple = (480, 848),  # standard RealSense collection resolution
     image_size_resize: tuple = (672, 672),
     vision_strides: dict = {"patch_stride": 14, "conv_stride": 2},
 ):
@@ -345,4 +345,3 @@ class TactileContrastiveLoss(nn.Module):
                                        linear_positive_img_indices.view(-1))
         
         return (loss_tac_pc + loss_tac_img) / 2
-

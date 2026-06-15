@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import sys
 import time
 from dataclasses import dataclass
@@ -33,6 +34,13 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from timestamp_utils import get_timestamp_us
+from realsense_standard import (
+    CAMERA_METADATA_FILE,
+    STANDARD_RS_FPS,
+    STANDARD_RS_HEIGHT,
+    STANDARD_RS_WIDTH,
+    standard_realsense_profile,
+)
 from session_schema import (
     WORLD_CAMERA,
     WRIST_CAMERA,
@@ -71,15 +79,16 @@ class SessionPaths:
     wrist_rgb: Path
     wrist_depth: Path
     pressure: Path
+    camera_metadata: Path
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Dual RealSense + robot arm + pressure + gripper recorder.")
     parser.add_argument("--world-serial", default=None, help="Serial number for the world RealSense camera.")
     parser.add_argument("--wrist-serial", default=None, help="Serial number for the wrist RealSense camera.")
-    parser.add_argument("--width", type=int, default=848, help="RealSense RGB/depth frame width.")
-    parser.add_argument("--height", type=int, default=480, help="RealSense RGB/depth frame height.")
-    parser.add_argument("--rs-fps", type=int, default=30, help="RealSense camera FPS (supports 30/60/90).")
+    parser.add_argument("--width", type=int, default=STANDARD_RS_WIDTH, help="Standard RealSense RGB/depth width.")
+    parser.add_argument("--height", type=int, default=STANDARD_RS_HEIGHT, help="Standard RealSense RGB/depth height.")
+    parser.add_argument("--rs-fps", type=int, default=STANDARD_RS_FPS, help="Standard RealSense camera FPS.")
     parser.add_argument("--output", type=Path, default=Path("sessions"), help="Base directory for recordings.")
     parser.add_argument(
         "--session-prefix",
@@ -118,6 +127,7 @@ def create_session_paths(base: Path, prefix: str) -> SessionPaths:
         wrist_rgb=wrist_rgb_dir,
         wrist_depth=wrist_depth_dir,
         pressure=pressure_dir,
+        camera_metadata=session_root / CAMERA_METADATA_FILE,
     )
 
 
@@ -453,6 +463,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _start_recording(self) -> None:
         self.session_paths = create_session_paths(self.args.output, self.args.session_prefix)
+        self._write_camera_metadata(self.session_paths)
         self.pressure.start_session(self.session_paths.root)
         self.robot.start_session(self.session_paths.root)
         if self.gripper is not None:
@@ -471,6 +482,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.frame_id = 0
         self.recording = True
         print(f"Recording started. Session: {self.session_paths.root.name}")
+
+    def _write_camera_metadata(self, session_paths: SessionPaths) -> None:
+        payload = {
+            "schema": "dual_realsense_camera_metadata/v1",
+            "standard_profile": standard_realsense_profile(),
+            "visual_recording_fps": VISUAL_FPS,
+            "depth_note": "Depth PNG files are aligned to RGB/color pixels and saved as uint16 millimeters.",
+            "cameras": {
+                WORLD_CAMERA: self.world_camera.get_metadata(),
+                WRIST_CAMERA: self.wrist_camera.get_metadata(),
+            },
+        }
+        with open(session_paths.camera_metadata, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"Camera metadata saved: {session_paths.camera_metadata}")
 
     def _stop_recording(self) -> None:
         self.pressure.stop_session()

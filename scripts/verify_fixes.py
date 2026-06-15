@@ -12,6 +12,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from session_schema import common_frame_stems, find_session_dirs, resolve_session_layout
+from realsense_standard import CAMERA_METADATA_FILE
 
 SESSIONS_ROOT = Path("dataset/phase2_realdata_sessions/sessions")
 
@@ -151,6 +152,8 @@ def verify_structure_integrity():
         if not layout.is_legacy:
             if layout.world.depth is None or layout.wrist.depth is None:
                 issues.append(f"{sdir.name}: dual RealSense session missing depth directory")
+            if not (sdir / CAMERA_METADATA_FILE).is_file():
+                issues.append(f"{sdir.name}: missing {CAMERA_METADATA_FILE}")
 
         stems = common_frame_stems(layout)
         if not stems:

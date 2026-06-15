@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from typing import Optional
 
 import numpy as np
+from realsense_standard import (
+    DEPTH_PNG_UNIT,
+    DEPTH_PNG_UNIT_M,
+    STANDARD_RS_FPS,
+    STANDARD_RS_HEIGHT,
+    STANDARD_RS_WIDTH,
+    standard_realsense_profile,
+)
 
 try:
     import pyrealsense2 as rs
@@ -20,9 +29,9 @@ class RealSenseRGB:
 
     def __init__(
         self,
-        width: int = 848,
-        height: int = 480,
-        fps: int = 30,
+        width: int = STANDARD_RS_WIDTH,
+        height: int = STANDARD_RS_HEIGHT,
+        fps: int = STANDARD_RS_FPS,
         enable_depth: bool = True,
         enable_filters: bool = False,
         serial_number: str | None = None,
@@ -42,9 +51,11 @@ class RealSenseRGB:
         self.align: Optional[object] = None
         self.available = False
         self.last_warn_time = 0.0
+        self.depth_scale_m = DEPTH_PNG_UNIT_M
+        self.metadata: dict = self._build_metadata(available=False)
 
         self._last_color: Optional[np.ndarray] = None
-        self._last_depth: Optional[np.ndarray] = None
+        self._last_depth_raw: Optional[np.ndarray] = None
         self._frame_count = 0
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -87,12 +98,14 @@ class RealSenseRGB:
         if not self.enabled:
             self.pipeline = None
             self.available = False
+            self.metadata = self._build_metadata(available=False, note="disabled")
             print(f"Warning: {self.name} disabled. Using zero-filled RealSense frames.")
             return
 
         if rs is None:
             self.pipeline = None
             self.available = False
+            self.metadata = self._build_metadata(available=False, note="pyrealsense2 not installed")
             print(f"Warning: pyrealsense2 not installed. Using zero-filled {self.name} frames.")
             return
 
@@ -117,6 +130,7 @@ class RealSenseRGB:
         except RuntimeError as exc:
             self.pipeline = None
             self.available = False
+            self.metadata = self._build_metadata(available=False, note=str(exc))
             print(
                 f"Warning: {self.name} pipeline could not start. "
                 "Using zero-filled frames. Details: "
@@ -126,10 +140,13 @@ class RealSenseRGB:
 
         # 调整传感器设置
         device = pipeline_profile.get_device()
+        self.metadata = self._metadata_from_profile(pipeline_profile, device)
 
         # 关闭自动曝光（训练数据一致性）
         try:
             depth_sensor = device.first_depth_sensor()
+            self.depth_scale_m = float(depth_sensor.get_depth_scale())
+            self.metadata["depth"]["sensor_depth_scale_m_per_unit"] = self.depth_scale_m
             if depth_sensor.supports(rs.option.enable_auto_exposure):
                 depth_sensor.set_option(rs.option.enable_auto_exposure, 0)
         except Exception:
@@ -177,20 +194,21 @@ class RealSenseRGB:
 
                 color_data = np.asanyarray(color_frame.get_data())
 
-                depth_data = None
+                depth_data_raw = None
                 if self.enable_depth:
                     depth_frame = frames.get_depth_frame()
-                    if depth_frame:
-                        # 深度滤波可选（默认关闭，离线处理）
-                        if self.enable_filters:
-                            depth_frame = rs.spatial_filter().process(depth_frame)
-                            depth_frame = rs.temporal_filter().process(depth_frame)
-                            depth_frame = rs.hole_filling_filter().process(depth_frame)
-                        depth_data = np.asanyarray(depth_frame.get_data())
+                    if not depth_frame:
+                        continue
+                    # 深度滤波可选（默认关闭，离线处理）
+                    if self.enable_filters:
+                        depth_frame = rs.spatial_filter().process(depth_frame)
+                        depth_frame = rs.temporal_filter().process(depth_frame)
+                        depth_frame = rs.hole_filling_filter().process(depth_frame)
+                    depth_data_raw = np.asanyarray(depth_frame.get_data())
 
                 with self._lock:
                     self._last_color = color_data
-                    self._last_depth = depth_data
+                    self._last_depth_raw = depth_data_raw
                     self._frame_count += 1
 
             except Exception as e:
@@ -205,15 +223,28 @@ class RealSenseRGB:
         return self._zero_frame()
 
     def read_depth(self) -> np.ndarray:
-        """非阻塞读取最新深度帧。"""
+        """Read latest aligned depth frame as uint16 millimeters."""
+        raw = self.read_depth_raw()
+        if self.depth_scale_m == DEPTH_PNG_UNIT_M:
+            return raw
+        depth_m = raw.astype(np.float32) * float(self.depth_scale_m)
+        depth_mm = np.rint(depth_m / DEPTH_PNG_UNIT_M)
+        return np.clip(depth_mm, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+
+    def read_depth_raw(self) -> np.ndarray:
+        """Read latest aligned RealSense z16 depth frame in sensor units."""
         with self._lock:
-            if self._last_depth is not None:
-                return self._last_depth.copy()
+            if self._last_depth_raw is not None:
+                return self._last_depth_raw.copy()
         return self._zero_depth()
 
     def get_frame_count(self) -> int:
         with self._lock:
             return self._frame_count
+
+    def get_metadata(self) -> dict:
+        with self._lock:
+            return copy.deepcopy(self.metadata)
 
     def stop(self) -> None:
         self._running = False
@@ -225,7 +256,7 @@ class RealSenseRGB:
             self.pipeline = None
         self.align = None
         self._last_color = None
-        self._last_depth = None
+        self._last_depth_raw = None
         self._frame_count = 0
         self.available = False
 
@@ -234,3 +265,76 @@ class RealSenseRGB:
 
     def _zero_depth(self) -> np.ndarray:
         return np.zeros((self.height, self.width), dtype=np.uint16)
+
+    def _build_metadata(self, available: bool, note: str | None = None) -> dict:
+        metadata = {
+            "name": self.name,
+            "available": available,
+            "serial_number": self.serial_number,
+            "profile": {
+                **standard_realsense_profile(),
+                "width": self.width,
+                "height": self.height,
+                "fps": self.fps,
+            },
+            "color": {"intrinsics": None},
+            "depth": {
+                "intrinsics": None,
+                "aligned_to": "color" if self.enable_depth else None,
+                "saved_pixel_intrinsics_source": "color" if self.enable_depth else None,
+                "sensor_depth_scale_m_per_unit": self.depth_scale_m,
+                "saved_png_unit": DEPTH_PNG_UNIT,
+                "saved_png_unit_m": DEPTH_PNG_UNIT_M,
+                "saved_png_dtype": "uint16",
+            },
+        }
+        if note:
+            metadata["note"] = note
+        return metadata
+
+    @staticmethod
+    def _intrinsics_to_dict(intr) -> dict:
+        return {
+            "width": int(intr.width),
+            "height": int(intr.height),
+            "fx": float(intr.fx),
+            "fy": float(intr.fy),
+            "ppx": float(intr.ppx),
+            "ppy": float(intr.ppy),
+            "model": str(intr.model),
+            "coeffs": [float(v) for v in intr.coeffs],
+            "K": [
+                [float(intr.fx), 0.0, float(intr.ppx)],
+                [0.0, float(intr.fy), float(intr.ppy)],
+                [0.0, 0.0, 1.0],
+            ],
+        }
+
+    def _metadata_from_profile(self, pipeline_profile, device) -> dict:
+        metadata = self._build_metadata(available=True)
+        try:
+            metadata["device"] = {
+                "name": device.get_info(rs.camera_info.name),
+                "serial_number": device.get_info(rs.camera_info.serial_number),
+                "firmware_version": device.get_info(rs.camera_info.firmware_version),
+            }
+            metadata["serial_number"] = metadata["device"]["serial_number"]
+        except Exception:
+            pass
+
+        try:
+            color_stream = pipeline_profile.get_stream(rs.stream.color)
+            color_intr = color_stream.as_video_stream_profile().get_intrinsics()
+            metadata["color"]["intrinsics"] = self._intrinsics_to_dict(color_intr)
+        except Exception:
+            pass
+
+        if self.enable_depth:
+            try:
+                depth_stream = pipeline_profile.get_stream(rs.stream.depth)
+                depth_intr = depth_stream.as_video_stream_profile().get_intrinsics()
+                metadata["depth"]["intrinsics"] = self._intrinsics_to_dict(depth_intr)
+            except Exception:
+                pass
+
+        return metadata
