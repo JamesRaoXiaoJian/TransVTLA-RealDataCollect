@@ -7,7 +7,7 @@
     2. 动态基线消除（取前 50 行均值作为基线）
     3. 全局 Min-Max 归一化到 [0, 1]
     4. 滑动窗口切片为 [Samples, window_size, 20] 张量
-    5. 保存为 .npy 文件
+    5. 保存为 .npz 文件，并保留窗口时间戳用于同步
 
 用法：
     python preprocess_pressure.py --data-root sessions --output processed_data.npz
@@ -35,9 +35,7 @@ from channel_config import (
 LEFT_TOTAL_CH = LEFT_CHANNEL
 RIGHT_TOTAL_CH = RIGHT_CHANNEL
 
-# CSV 中的列名格式为 CH1, CH2, ..., CH64
-# pandas 读入后列索引从 0 开始，通道号需减 1 映射到列索引
-VALID_COL_INDICES: list[int] = [ch - 1 for ch in VALID_CHANNELS]
+VALID_COL_NAMES: list[str] = [f"CH{ch}" for ch in VALID_CHANNELS]
 
 # ============================================================
 # 处理参数
@@ -49,30 +47,45 @@ STRIDE = 1                   # 滑动窗口步长
 
 
 def load_pressure_csv(csv_path: Path) -> pd.DataFrame:
-    """读取单个 pressure.csv 文件，返回 DataFrame。
+    """读取单个 pressure.csv 文件，返回标准 20 通道 DataFrame。
 
-    CSV 格式：timestamp_us, CH1, CH2, ..., CH64
-    第一列为时间戳，后续 64 列为 ADC 通道值。
+    兼容旧格式（timestamp_us + CH1..CH64）和新格式
+    （sensor_timestamp_us + host_monotonic_us + 标准 20 通道）。
     """
     df = pd.read_csv(csv_path)
-    # 丢弃 timestamp_us 列，只保留通道数据
-    ch_cols = [f"CH{i}" for i in range(1, 65)]
-    missing = [c for c in ch_cols if c not in df.columns]
+    missing = [c for c in VALID_COL_NAMES if c not in df.columns]
     if missing:
         raise ValueError(f"CSV 缺少列: {missing}，文件: {csv_path}")
-    return df[ch_cols]
+    return df[VALID_COL_NAMES]
+
+
+def load_pressure_csv_with_timestamps(csv_path: Path) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
+    """读取压力 CSV，返回标准 20 通道和可用时间戳数组。"""
+    raw = pd.read_csv(csv_path)
+    missing = [c for c in VALID_COL_NAMES if c not in raw.columns]
+    if missing:
+        raise ValueError(f"CSV 缺少列: {missing}，文件: {csv_path}")
+
+    timestamps: dict[str, np.ndarray] = {}
+    for col in ("sensor_timestamp_us", "host_monotonic_us", "timestamp_us"):
+        if col in raw.columns:
+            timestamps[col] = raw[col].to_numpy(dtype=np.int64, copy=True)
+    if "sensor_timestamp_us" not in timestamps and "timestamp_us" in timestamps:
+        timestamps["sensor_timestamp_us"] = timestamps["timestamp_us"].copy()
+    return raw[VALID_COL_NAMES], timestamps
 
 
 def extract_valid_channels(df: pd.DataFrame) -> np.ndarray:
     """从 64 通道 DataFrame 中提取 20 个有效通道，返回 (N, 20) 数组。
 
-    列索引对应关系：
-        CH1 -> col 0, CH2 -> col 1, ..., CH64 -> col 63
-    有效通道按 VALID_COL_INDICES 选取。
+    输入可以是完整 CH1..CH64，也可以已经是标准 20 通道。
 
     对于 INTERPOLATE_CHANNELS 中标记的异常通道，使用相邻通道均值替代。
     """
-    data = df.values[:, VALID_COL_INDICES].astype(np.float64)
+    missing = [c for c in VALID_COL_NAMES if c not in df.columns]
+    if missing:
+        raise ValueError(f"DataFrame 缺少有效通道列: {missing}")
+    data = df[VALID_COL_NAMES].values.astype(np.float64)
 
     # 处理需要插值的异常通道
     if INTERPOLATE_CHANNELS:
@@ -160,6 +173,23 @@ def sliding_window(data: np.ndarray, window_size: int = WINDOW_SIZE, stride: int
     return np.lib.stride_tricks.as_strided(data, shape=shape, strides=strides).copy()
 
 
+def sliding_window_timestamps(
+    timestamps: np.ndarray,
+    window_size: int = WINDOW_SIZE,
+    stride: int = STRIDE,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return start/end/center timestamps for each sliding window."""
+    n = len(timestamps)
+    if n < window_size:
+        empty = np.empty((0,), dtype=np.int64)
+        return empty, empty, empty
+    starts = np.arange(0, n - window_size + 1, stride, dtype=np.int64)
+    start_ts = timestamps[starts]
+    end_ts = timestamps[starts + window_size - 1]
+    center_ts = ((start_ts.astype(np.int64) + end_ts.astype(np.int64)) // 2).astype(np.int64)
+    return start_ts, end_ts, center_ts
+
+
 def process_single_csv(csv_path: Path) -> np.ndarray:
     """处理单个 CSV 文件，返回滑动窗口切片后的张量。
 
@@ -168,12 +198,32 @@ def process_single_csv(csv_path: Path) -> np.ndarray:
     Returns:
         (Samples, WINDOW_SIZE, 20) 的 numpy 数组
     """
-    df = load_pressure_csv(csv_path)
+    windows, _timestamps = process_single_csv_with_timestamps(csv_path)
+    return windows
+
+
+def process_single_csv_with_timestamps(csv_path: Path) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """处理单个 CSV，并返回窗口张量与同步时间戳。"""
+    df, timestamps = load_pressure_csv_with_timestamps(csv_path)
     data = extract_valid_channels(df)
     delta = baseline_subtract(data)
     normed = normalize(delta)
     windows = sliding_window(normed)
-    return windows
+
+    output_ts: dict[str, np.ndarray] = {}
+    for key, values in timestamps.items():
+        output_ts[key] = values
+    host_ts = timestamps.get("host_monotonic_us")
+    if host_ts is not None:
+        start_ts, end_ts, center_ts = sliding_window_timestamps(host_ts)
+        output_ts["window_start_host_us"] = start_ts
+        output_ts["window_end_host_us"] = end_ts
+        output_ts["window_center_host_us"] = center_ts
+    sensor_ts = timestamps.get("sensor_timestamp_us")
+    if sensor_ts is not None:
+        _start_ts, _end_ts, center_ts = sliding_window_timestamps(sensor_ts)
+        output_ts["window_center_sensor_us"] = center_ts
+    return windows, output_ts
 
 
 def process_all_sessions(data_root: Path, output_path: Path | None = None) -> None:
@@ -204,7 +254,7 @@ def process_all_sessions(data_root: Path, output_path: Path | None = None) -> No
         session_dir = csv_path.parent.parent
         session_name = session_dir.name
         try:
-            windows = process_single_csv(csv_path)
+            windows, timestamps = process_single_csv_with_timestamps(csv_path)
         except Exception as e:
             print(f"  跳过 {session_name}: {e}")
             continue
@@ -232,6 +282,7 @@ def process_all_sessions(data_root: Path, output_path: Path | None = None) -> No
             stride=STRIDE,
             max_pressure_drop=MAX_PRESSURE_DROP,
             baseline_rows=BASELINE_ROWS,
+            **timestamps,
         )
         total_samples += windows.shape[0]
         print(f"  {session_name}: {windows.shape[0]} 个样本 -> {out_path}")
@@ -282,7 +333,8 @@ def run_test() -> None:
     raw = np.random.randint(4700, 5007, size=(n_rows, n_channels)).astype(np.float64)
 
     # 在有效通道上模拟按压
-    for col_idx in VALID_COL_INDICES:
+    for ch in VALID_CHANNELS:
+        col_idx = ch - 1
         raw[100:200, col_idx] = np.random.randint(1500, 3000, size=100).astype(np.float64)
         raw[300:350, col_idx] = np.random.randint(2000, 3500, size=50).astype(np.float64)
 

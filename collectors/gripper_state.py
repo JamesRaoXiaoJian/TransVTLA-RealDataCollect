@@ -11,7 +11,7 @@ from Robotic_Arm.rm_robot_interface import RoboticArm, rm_thread_mode_e
 from collectors.robot_arm import DEFAULT_ARM_HOST, DEFAULT_ARM_PORT
 from timestamp_utils import get_timestamp_us
 
-GRIPPER_FPS = 200  # 目标频率，实际取决于 SDK 调用耗时
+GRIPPER_FPS = 100  # 目标频率，实际取决于 SDK 调用耗时
 GRIPPER_INTERVAL_S = 0.0  # 不额外 sleep，让 SDK 调用耗时决定节奏
 GRIPPER_BATCH_SIZE = 100
 GRIPPER_FLUSH_INTERVAL_S = 0.1

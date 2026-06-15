@@ -1,17 +1,17 @@
 """Collect synchronized data from two RealSense RGB-D cameras, robot, pressure, and gripper state.
 
 Sampling rates:
-    - Visual (world RealSense + wrist RealSense): 20Hz
+    - Visual (world RealSense + wrist RealSense): 30Hz
     - Tactile/Pressure: 200Hz
     - Robot Arm State: 100Hz
-    - Gripper RM Plus State: 200Hz target
+    - Gripper RM Plus State: 100Hz target
 
 Press SPACE to start/stop individual recording sessions. Each session creates a
 timestamped folder containing:
-    - `world_camera/rgb/`   : world RealSense RGB frames (20Hz)
-    - `world_camera/depth/` : world RealSense depth frames (20Hz, 16-bit PNG)
-    - `wrist_camera/rgb/`   : wrist RealSense RGB frames (20Hz)
-    - `wrist_camera/depth/` : wrist RealSense depth frames (20Hz, 16-bit PNG)
+    - `world_camera/rgb/`   : world RealSense RGB frames (30Hz)
+    - `world_camera/depth/` : world RealSense depth frames (30Hz, 16-bit PNG)
+    - `wrist_camera/rgb/`   : wrist RealSense RGB frames (30Hz)
+    - `wrist_camera/depth/` : wrist RealSense depth frames (30Hz, 16-bit PNG)
     - `robot_state/`     : CSV robot arm state + gripper state
     - `pressure/`        : CSV pressure samples at 200Hz
 
@@ -23,7 +23,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import queue
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -61,8 +63,9 @@ from collectors.pressure import (
 )
 from collectors.robot_arm import DEFAULT_ARM_HOST, DEFAULT_ARM_PORT
 
-VISUAL_FPS = 20
+VISUAL_FPS = 30
 VISUAL_INTERVAL_S = 1.0 / VISUAL_FPS
+FRAME_SAVE_QUEUE_SIZE = 180
 
 # Pressure channel mapping (from Channel Mapping.txt)
 from channel_config import (
@@ -80,6 +83,116 @@ class SessionPaths:
     wrist_depth: Path
     pressure: Path
     camera_metadata: Path
+
+
+@dataclass
+class FrameSaveTask:
+    frame_id: int
+    capture_us: int
+    world_rgb: np.ndarray
+    world_depth: np.ndarray
+    wrist_rgb: np.ndarray
+    wrist_depth: np.ndarray
+
+
+class FrameSaveWorker:
+    """Background image/metadata writer so preview never blocks on disk I/O."""
+
+    def __init__(self, session_paths: SessionPaths, queue_size: int = FRAME_SAVE_QUEUE_SIZE):
+        self.session_paths = session_paths
+        self.queue: queue.Queue[FrameSaveTask | None] = queue.Queue(maxsize=queue_size)
+        self.thread: threading.Thread | None = None
+        self.running = False
+        self.dropped_tasks = 0
+        self.failed_writes = 0
+        self.saved_frames = 0
+        self.max_queue_depth = 0
+        self.frames_file = None
+        self.frames_writer: csv.writer | None = None
+
+    def start(self) -> None:
+        frames_path = self.session_paths.root / "frames.csv"
+        self.frames_file = open(frames_path, "w", newline="", encoding="utf-8")
+        self.frames_writer = csv.writer(self.frames_file)
+        self.frames_writer.writerow([
+            "frame_id", "capture_monotonic_us",
+            "world_rgb_save_us", "world_depth_save_us",
+            "wrist_rgb_save_us", "wrist_depth_save_us",
+            "save_complete_us", "save_queue_depth",
+        ])
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def enqueue(self, task: FrameSaveTask) -> bool:
+        try:
+            self.queue.put_nowait(task)
+        except queue.Full:
+            self.dropped_tasks += 1
+            return False
+        self.max_queue_depth = max(self.max_queue_depth, self.queue.qsize())
+        return True
+
+    def stop(self) -> None:
+        if self.running:
+            self.running = False
+            self.queue.put(None)
+        if self.thread is not None:
+            self.thread.join(timeout=10.0)
+            self.thread = None
+        if self.frames_file is not None:
+            self.frames_file.flush()
+            self.frames_file.close()
+            self.frames_file = None
+        self.frames_writer = None
+
+    def _run(self) -> None:
+        while True:
+            task = self.queue.get()
+            try:
+                if task is None:
+                    break
+                self._save_task(task)
+            finally:
+                self.queue.task_done()
+
+    def _save_task(self, task: FrameSaveTask) -> None:
+        image_name = f"{task.frame_id:04d}.jpg"
+        depth_name = f"{task.frame_id:04d}.png"
+        try:
+            ok = cv2.imwrite(
+                str(self.session_paths.world_rgb / image_name),
+                task.world_rgb,
+                [cv2.IMWRITE_JPEG_QUALITY, 85],
+            )
+            world_rgb_save_us = get_timestamp_us()
+            ok = cv2.imwrite(str(self.session_paths.world_depth / depth_name), task.world_depth) and ok
+            world_depth_save_us = get_timestamp_us()
+            ok = cv2.imwrite(
+                str(self.session_paths.wrist_rgb / image_name),
+                task.wrist_rgb,
+                [cv2.IMWRITE_JPEG_QUALITY, 85],
+            ) and ok
+            wrist_rgb_save_us = get_timestamp_us()
+            ok = cv2.imwrite(str(self.session_paths.wrist_depth / depth_name), task.wrist_depth) and ok
+            wrist_depth_save_us = get_timestamp_us()
+            save_complete_us = get_timestamp_us()
+            if not ok:
+                self.failed_writes += 1
+        except Exception:
+            self.failed_writes += 1
+            return
+
+        if self.frames_writer is not None:
+            self.frames_writer.writerow([
+                task.frame_id, task.capture_us,
+                world_rgb_save_us, world_depth_save_us,
+                wrist_rgb_save_us, wrist_depth_save_us,
+                save_complete_us, self.queue.qsize(),
+            ])
+            if task.frame_id % VISUAL_FPS == 0 and self.frames_file is not None:
+                self.frames_file.flush()
+        self.saved_frames += 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -383,8 +496,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recording = False
         self.session_paths: SessionPaths | None = None
         self.frame_id = 0
-        self.frames_file = None
-        self.frames_writer = None
+        self.save_worker: FrameSaveWorker | None = None
 
         self._build_ui()
         self._start_collectors()
@@ -469,15 +581,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.gripper is not None:
             self.gripper.start_session(self.session_paths.root)
 
-        # 创建 frames.csv（帧元数据）
-        frames_path = self.session_paths.root / "frames.csv"
-        self.frames_file = open(frames_path, "w", newline="", encoding="utf-8")
-        self.frames_writer = csv.writer(self.frames_file)
-        self.frames_writer.writerow([
-            "frame_id", "capture_monotonic_us",
-            "world_rgb_save_us", "world_depth_save_us",
-            "wrist_rgb_save_us", "wrist_depth_save_us",
-        ])
+        self.save_worker = FrameSaveWorker(self.session_paths)
+        self.save_worker.start()
 
         self.frame_id = 0
         self.recording = True
@@ -504,18 +609,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.gripper is not None:
             self.gripper.stop_session()
 
-        # 关闭 frames.csv
-        if hasattr(self, 'frames_file') and self.frames_file is not None:
-            self.frames_file.close()
-            self.frames_file = None
-            self.frames_writer = None
+        saved = dropped = failed = max_q = 0
+        if self.save_worker is not None:
+            self.save_worker.stop()
+            saved = self.save_worker.saved_frames
+            dropped = self.save_worker.dropped_tasks
+            failed = self.save_worker.failed_writes
+            max_q = self.save_worker.max_queue_depth
+            self.save_worker = None
 
         self.session_paths = None
         self.frame_id = 0
         self.recording = False
-        print("Recording paused. Press SPACE to start a new session.")
+        print(
+            "Recording paused. "
+            f"saved_frames={saved}, dropped_save_tasks={dropped}, "
+            f"failed_writes={failed}, max_save_queue={max_q}. "
+            "Press SPACE to start a new session."
+        )
 
-    # ---- Timer callback (20Hz) ----
+    # ---- Timer callback (30Hz) ----
 
     def _on_timer(self) -> None:
         world_rgb = self.world_camera.read()
@@ -530,7 +643,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Status
         status = "REC" if self.recording else "IDLE"
-        self.status_label.setText(f"Status: {status} | Frames: {self.frame_id if self.recording else 0}")
+        queue_text = ""
+        if self.save_worker is not None:
+            queue_text = (
+                f" | SaveQ: {self.save_worker.queue.qsize()}"
+                f" | Drop: {self.save_worker.dropped_tasks}"
+            )
+        self.status_label.setText(
+            f"Status: {status} | Frames: {self.frame_id if self.recording else 0}{queue_text}"
+        )
 
         # Robot + gripper state → dashboard
         joints = self.robot.get_latest_joints()
@@ -553,41 +674,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pressure_dashboard.set_state_info(f"{joint_text}\n{pose_text}\n{gripper_text}")
         self.pressure_dashboard.set_values(self.pressure.get_latest_values())
 
-        # Save frames
-        if self.recording and self.session_paths is not None:
+        # Save frames asynchronously. The UI thread only packages the latest synchronized sample.
+        if self.recording and self.session_paths is not None and self.save_worker is not None:
             self.frame_id += 1
-            image_name = f"{self.frame_id:04d}.jpg"
-            depth_name = f"{self.frame_id:04d}.png"
-
-            # 使用 cv2.imwrite 保存 JPEG (Q85)，替代 QImage.save（更快）
             capture_us = get_timestamp_us()
-            cv2.imwrite(
-                str(self.session_paths.world_rgb / image_name), world_rgb,
-                [cv2.IMWRITE_JPEG_QUALITY, 85],
+            self.save_worker.enqueue(
+                FrameSaveTask(
+                    frame_id=self.frame_id,
+                    capture_us=capture_us,
+                    world_rgb=world_rgb,
+                    world_depth=world_depth,
+                    wrist_rgb=wrist_rgb,
+                    wrist_depth=wrist_depth,
+                )
             )
-            world_rgb_save_us = get_timestamp_us()
-
-            cv2.imwrite(str(self.session_paths.world_depth / depth_name), world_depth)
-            world_depth_save_us = get_timestamp_us()
-
-            cv2.imwrite(
-                str(self.session_paths.wrist_rgb / image_name), wrist_rgb,
-                [cv2.IMWRITE_JPEG_QUALITY, 85],
-            )
-            wrist_rgb_save_us = get_timestamp_us()
-
-            cv2.imwrite(str(self.session_paths.wrist_depth / depth_name), wrist_depth)
-            wrist_depth_save_us = get_timestamp_us()
-
-            # 记录帧元数据
-            if self.frames_writer is not None:
-                self.frames_writer.writerow([
-                    self.frame_id, capture_us,
-                    world_rgb_save_us, world_depth_save_us,
-                    wrist_rgb_save_us, wrist_depth_save_us,
-                ])
-                if self.frame_id % 10 == 0:
-                    self.frames_file.flush()
 
     # ---- Keyboard ----
 

@@ -6,18 +6,18 @@ Phase2 RLDS 数据集构建脚本
 数据源结构:
   sessions/{object_type}_sampleN/session_YYYYMMDD_HHMMSS/
     ├── world_camera/
-    │   ├── rgb/              0001.jpg ~ NNNN.jpg  (20 Hz)
-    │   └── depth/            0001.png ~ NNNN.png  (20 Hz, 16-bit)
+    │   ├── rgb/              0001.jpg ~ NNNN.jpg  (30 Hz)
+    │   └── depth/            0001.png ~ NNNN.png  (30 Hz, 16-bit)
     ├── wrist_camera/
-    │   ├── rgb/              0001.jpg ~ NNNN.jpg  (20 Hz)
-    │   └── depth/            0001.png ~ NNNN.png  (20 Hz, 16-bit)
-    ├── robot_state/          robot_state.csv      (200 Hz)
+    │   ├── rgb/              0001.jpg ~ NNNN.jpg  (30 Hz)
+    │   └── depth/            0001.png ~ NNNN.png  (30 Hz, 16-bit)
+    ├── robot_state/          robot_state.csv
     └── preprocessed_pressure/ {session}.npz       (滑窗后的触觉帧)
 
 核心策略:
-  - 以视觉帧 (20 Hz) 为基准时间轴
-  - 机械臂状态 (200 Hz) 通过最近邻时间戳下采样对齐到 20 Hz
-  - 触觉数据 (npz, shape=(T, 16, 20)) 通过帧索引下采样对齐到 20 Hz
+  - 以视觉帧 (30 Hz) 为基准时间轴
+  - 优先读取 sync/sync_index.csv 做跨模态时间对齐
+  - 触觉数据 (npz, shape=(T, 16, 20)) 通过窗口中心时间戳对齐到视觉帧
   - 注入物体属性字段，与 util/prompting.py 的 build_object_attr_inputs 对齐
 """
 
@@ -36,14 +36,14 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import cv2
 import numpy as np
 import tensorflow_datasets as tfds
-from session_schema import common_frame_stems, depth_path, resolve_session_layout, rgb_path
+from session_schema import common_frame_stems, depth_path, resolve_session_layout, rgb_path, sync_index_path
 
 # ============================================================
 # 采样率常量
 # ============================================================
-VISUAL_FPS = 20
+VISUAL_FPS = 30
 TACTILE_FPS = 200
-ROBOT_ARM_FPS = 200
+ROBOT_ARM_FPS = 100
 
 # ============================================================
 # 触觉窗口参数 (与预处理脚本一致)
@@ -158,14 +158,50 @@ def load_robot_csv(csv_path: Path) -> Tuple[np.ndarray, np.ndarray]:
     return np.array(timestamps, dtype=np.int64), np.array(poses, dtype=np.float32)
 
 
-def load_tactile_npz(npz_path: Path) -> np.ndarray:
-    """读取预处理后的触觉 npz，返回 data 数组 shape=(T, 16, 20)。"""
+def load_gripper_csv(csv_path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    """读取 gripper_state.csv，返回 (timestamps_us, gripper_pos)。"""
+    if not csv_path.exists():
+        return np.array([], dtype=np.int64), np.array([], dtype=np.float32)
+
+    timestamps = []
+    positions = []
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ts = row.get("timestamp_us")
+            pos = row.get("gripper_pos")
+            if not ts or pos in (None, ""):
+                continue
+            try:
+                timestamps.append(int(float(ts)))
+                positions.append(float(pos))
+            except ValueError:
+                continue
+    return np.array(timestamps, dtype=np.int64), np.array(positions, dtype=np.float32)
+
+
+def load_sync_index(csv_path: Path) -> list[dict[str, str]]:
+    """读取标准同步索引。缺失时返回空列表。"""
+    if not csv_path.exists():
+        return []
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def load_tactile_npz(npz_path: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """读取预处理后的触觉 npz，返回 data 和窗口中心 host 时间戳。"""
     data = np.load(str(npz_path))
-    return data["data"].astype(np.float32)
+    tactile = data["data"].astype(np.float32)
+    timestamps = data["window_center_host_us"].astype(np.int64) if "window_center_host_us" in data else None
+    return tactile, timestamps
 
 
 def nearest_indices(target_ts: np.ndarray, source_ts: np.ndarray) -> np.ndarray:
     """对于 target_ts 中每个时间戳，找到 source_ts 中最近邻的索引。"""
+    if len(source_ts) == 0 or len(target_ts) == 0:
+        return np.array([], dtype=np.int64)
+    if len(source_ts) == 1:
+        return np.zeros(len(target_ts), dtype=np.int64)
     # source_ts 必须有序
     idx = np.searchsorted(source_ts, target_ts, side="left")
     idx = np.clip(idx, 1, len(source_ts) - 1)
@@ -174,6 +210,16 @@ def nearest_indices(target_ts: np.ndarray, source_ts: np.ndarray) -> np.ndarray:
     pick_left = (target_ts - left) <= (right - target_ts)
     idx = np.where(pick_left, idx - 1, idx)
     return idx
+
+
+def _row_int(row: dict[str, str], key: str, default: int = -1) -> int:
+    value = row.get(key)
+    if value in (None, ""):
+        return default
+    try:
+        return int(float(value))
+    except ValueError:
+        return default
 
 
 def resample_by_index_step(total_source_frames: int, total_target_frames: int) -> np.ndarray:
@@ -190,7 +236,7 @@ def resample_by_index_step(total_source_frames: int, total_target_frames: int) -
 
 _DESCRIPTION = """
 TransVTLA Phase2 真机数据集 (RLDS 格式)。
-- 以视觉帧 (20Hz) 为基准
+- 以视觉帧 (30Hz) 为基准
 - 包含触觉/压力数据 (16x20 窗口)
 - 包含物体属性字段用于提示词注入
 """
@@ -373,6 +419,7 @@ class Phase2RobotData(tfds.core.GeneratorBasedBuilder):
             return None
 
         csv_path = session_dir / "robot_state" / "robot_state.csv"
+        gripper_path = session_dir / "robot_state" / "gripper_state.csv"
         npz_path = session_dir / "preprocessed_pressure" / f"{session_dir.name}.npz"
 
         # 1) 收集视觉帧: 按文件名排序，获取帧数 N_vis
@@ -387,37 +434,74 @@ class Phase2RobotData(tfds.core.GeneratorBasedBuilder):
         robot_ts, robot_poses = load_robot_csv(csv_path)
         if len(robot_ts) == 0:
             return None
+        gripper_ts, gripper_pos = load_gripper_csv(gripper_path)
 
         # 3) 加载触觉 npz
         has_tactile = npz_path.exists()
         tactile_data = None
+        tactile_ts = None
         if has_tactile:
-            tactile_data = load_tactile_npz(npz_path)
+            tactile_data, tactile_ts = load_tactile_npz(npz_path)
 
         # 4) 以视觉帧为基准进行时间对齐
-        #    视觉帧: 均匀分布在整个 recording 时间跨度上
-        #    通过 robot CSV 的时间戳计算 recording 跨度
-        rec_start = robot_ts[0]
-        rec_end = robot_ts[-1]
-        rec_duration_us = rec_end - rec_start
-        if rec_duration_us <= 0:
-            return None
+        sync_rows = load_sync_index(sync_index_path(session_dir))
+        if sync_rows:
+            stem_set = set(stems)
+            sync_rows = [row for row in sync_rows if row.get("frame_stem") in stem_set]
+            if not sync_rows:
+                return None
+            stems = [str(row["frame_stem"]) for row in sync_rows]
+            n_vis = len(stems)
+            vis_timestamps = np.array(
+                [_row_int(row, "capture_monotonic_us", 0) for row in sync_rows],
+                dtype=np.int64,
+            )
 
-        # 生成视觉帧的虚拟时间戳 (均匀间隔 1/VISUAL_FPS)
-        vis_interval_us = int(1e6 / VISUAL_FPS)
-        vis_timestamps = np.array(
-            [rec_start + i * vis_interval_us for i in range(n_vis)],
-            dtype=np.int64,
-        )
+            aligned_poses = np.zeros((n_vis, 6), dtype=np.float32)
+            for i, row in enumerate(sync_rows):
+                idx = _row_int(row, "robot_index", -1)
+                if 0 <= idx < len(robot_poses):
+                    aligned_poses[i] = robot_poses[idx]
 
-        # 将机械臂状态下采样到视觉帧: 最近邻匹配
-        robot_indices = nearest_indices(vis_timestamps, robot_ts)
-        aligned_poses = robot_poses[robot_indices]  # (n_vis, 6)
+            aligned_gripper = np.zeros(n_vis, dtype=np.float32)
+            for i, row in enumerate(sync_rows):
+                idx = _row_int(row, "gripper_index", -1)
+                if 0 <= idx < len(gripper_pos):
+                    aligned_gripper[i] = gripper_pos[idx]
+        else:
+            # Legacy fallback: synthesize a 30 Hz visual timeline from robot timestamps.
+            rec_start = robot_ts[0]
+            rec_end = robot_ts[-1]
+            rec_duration_us = rec_end - rec_start
+            if rec_duration_us <= 0:
+                return None
 
-        # 将触觉数据下采样到视觉帧: 均匀索引映射
+            vis_interval_us = int(1e6 / VISUAL_FPS)
+            vis_timestamps = np.array(
+                [rec_start + i * vis_interval_us for i in range(n_vis)],
+                dtype=np.int64,
+            )
+
+            robot_indices = nearest_indices(vis_timestamps, robot_ts)
+            aligned_poses = robot_poses[robot_indices]  # (n_vis, 6)
+            aligned_gripper = np.zeros(n_vis, dtype=np.float32)
+            if len(gripper_ts) and len(gripper_pos):
+                gripper_indices = nearest_indices(vis_timestamps, gripper_ts)
+                aligned_gripper = gripper_pos[gripper_indices]
+
+        # 将触觉数据对齐到视觉帧：优先使用窗口中心 host 时间戳，否则按索引均匀回退。
         aligned_tactile = None
         if tactile_data is not None and len(tactile_data) > 0:
-            tactile_indices = resample_by_index_step(len(tactile_data), n_vis)
+            if tactile_ts is not None and len(tactile_ts) > 0:
+                tactile_indices = nearest_indices(vis_timestamps, tactile_ts)
+                if len(tactile_indices) != n_vis:
+                    tactile_indices = resample_by_index_step(len(tactile_data), n_vis)
+                else:
+                    dt = np.abs(tactile_ts[tactile_indices] - vis_timestamps)
+                    if len(dt) and float(np.median(dt)) > 1_000_000.0:
+                        tactile_indices = resample_by_index_step(len(tactile_data), n_vis)
+            else:
+                tactile_indices = resample_by_index_step(len(tactile_data), n_vis)
             aligned_tactile = tactile_data[tactile_indices]  # (n_vis, 16, 20)
 
         # 5) 构建每个 step
@@ -431,13 +515,14 @@ class Phase2RobotData(tfds.core.GeneratorBasedBuilder):
             p_depth = self._load_depth(depth_path(layout.world, stem))
             w_depth = self._load_depth(depth_path(layout.wrist, stem))
 
-            # 机械臂状态: 6D pose + 1D gripper (暂填 0)
-            state_vec = np.concatenate([aligned_poses[i], [0.0]]).astype(np.float32)
+            # 机械臂状态: 6D pose + 1D gripper
+            state_vec = np.concatenate([aligned_poses[i], [aligned_gripper[i]]]).astype(np.float32)
 
             # Action: 下一帧 pose 减去当前帧 pose
             if i < n_vis - 1:
                 delta = aligned_poses[i + 1] - aligned_poses[i]
-                action_vec = np.concatenate([delta, [0.0]]).astype(np.float32)
+                gripper_delta = aligned_gripper[i + 1] - aligned_gripper[i]
+                action_vec = np.concatenate([delta, [gripper_delta]]).astype(np.float32)
             else:
                 action_vec = np.zeros(7, dtype=np.float32)
 

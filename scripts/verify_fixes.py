@@ -29,10 +29,11 @@ def verify_f1_pressure_monotonic():
         if not csv_path.exists():
             continue
 
-        with open(csv_path) as f:
-            reader = csv.reader(f)
-            next(reader)
-            ts = [int(row[0]) for row in reader]
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            header = reader.fieldnames or []
+            ts_col = "host_monotonic_us" if "host_monotonic_us" in header else header[0]
+            ts = [int(float(row[ts_col])) for row in reader if row.get(ts_col) not in (None, "")]
 
         for i in range(len(ts) - 1):
             if ts[i + 1] < ts[i]:

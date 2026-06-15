@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+import csv
 
 
 WORLD_CAMERA = "world_camera"
@@ -16,6 +17,15 @@ LEGACY_WRIST_DEPTH = "realsense_depth"
 
 RGB_EXT = ".jpg"
 DEPTH_EXT = ".png"
+FRAMES_FILE = "frames.csv"
+SYNC_DIR = "sync"
+SYNC_INDEX_FILE = "sync_index.csv"
+SYNC_SUMMARY_FILE = "sync_summary.json"
+PRESSURE_DIR = "pressure"
+PRESSURE_FILE = "pressure.csv"
+ROBOT_STATE_DIR = "robot_state"
+ROBOT_STATE_FILE = "robot_state.csv"
+GRIPPER_STATE_FILE = "gripper_state.csv"
 
 
 @dataclass(frozen=True)
@@ -117,6 +127,56 @@ def find_session_dirs(base: Path) -> list[Path]:
         sessions.append(candidate)
 
     return sorted(set(sessions), key=lambda p: str(p))
+
+
+def frames_csv_path(session_root: Path) -> Path:
+    return session_root / FRAMES_FILE
+
+
+def pressure_csv_path(session_root: Path) -> Path:
+    return session_root / PRESSURE_DIR / PRESSURE_FILE
+
+
+def robot_state_csv_path(session_root: Path) -> Path:
+    return session_root / ROBOT_STATE_DIR / ROBOT_STATE_FILE
+
+
+def gripper_state_csv_path(session_root: Path) -> Path:
+    return session_root / ROBOT_STATE_DIR / GRIPPER_STATE_FILE
+
+
+def sync_dir(session_root: Path) -> Path:
+    return session_root / SYNC_DIR
+
+
+def sync_index_path(session_root: Path) -> Path:
+    return sync_dir(session_root) / SYNC_INDEX_FILE
+
+
+def sync_summary_path(session_root: Path) -> Path:
+    return sync_dir(session_root) / SYNC_SUMMARY_FILE
+
+
+def read_frame_records(session_root: Path) -> list[dict[str, str]]:
+    path = frames_csv_path(session_root)
+    if not path.is_file():
+        return []
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def read_frame_timestamps_us(session_root: Path) -> list[int]:
+    records = read_frame_records(session_root)
+    timestamps: list[int] = []
+    for row in records:
+        value = row.get("capture_monotonic_us")
+        if value in (None, ""):
+            continue
+        try:
+            timestamps.append(int(float(value)))
+        except ValueError:
+            continue
+    return timestamps
 
 
 def _stems(directory: Path, suffix: str) -> set[str]:

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from timestamp_utils import get_timestamp_us
+from channel_config import VALID_CHANNELS
 
 TACTILE_FPS = 200
 
@@ -90,8 +91,9 @@ class PressureCollector:
             self._stop_session_locked()
             self.csv_file = open(csv_path, "w", newline="", encoding="utf-8")
             self.csv_writer = csv.writer(self.csv_file)
-            # 双时间戳：sensor_timestamp_us（传感器时钟）+ host_monotonic_us（主机单调时钟）
-            headers = ["sensor_timestamp_us", "host_monotonic_us"] + [f"CH{i+1}" for i in range(64)]
+            # 双时间戳：sensor_timestamp_us（传感器时钟）+ host_monotonic_us（主机单调时钟）。
+            # 落盘只保存建模使用的有效触觉通道，完整 64 通道仍保留在 latest_values 供实时显示。
+            headers = ["sensor_timestamp_us", "host_monotonic_us"] + [f"CH{i}" for i in VALID_CHANNELS]
             self.csv_writer.writerow(headers)
             self.row_buffer = []
             self.last_flush_time = time.time()
@@ -144,7 +146,8 @@ class PressureCollector:
 
                 if self.recording and self.csv_writer is not None:
                     # 双时间戳：传感器时钟 + 主机单调时钟
-                    row = [sensor_timestamp_us, host_monotonic_us] + self.latest_values
+                    selected_values = [self.latest_values[ch - 1] for ch in VALID_CHANNELS]
+                    row = [sensor_timestamp_us, host_monotonic_us] + selected_values
                     self.row_buffer.append(row)
                     self._flush_locked(force=False)
 

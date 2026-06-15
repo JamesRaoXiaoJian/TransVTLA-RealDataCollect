@@ -18,6 +18,8 @@
 - `data_viwer.py`：离线浏览已采集 session 的工具。
 - `calibration/world_realsense_calibration.py`：固定 world RealSense 相机到机械臂基座的外参标定。
 - `calibration/hand_eye_calibration.py`：wrist RealSense 手眼标定，读取标准 profile 下的 SDK 内参。
+- `scripts/build_sync_index.py`：为每个 session 生成标准多模态时间同步索引。
+- `scripts/trim_pressure_channels.py`：备份并裁剪历史压力 CSV，只保留标准 20 个触觉通道。
 - `Phase2_build_RLDSdata.py`：把采集 session 转换为 RGB-D RLDS/TFDS 数据。
 - `keybordControl.py`：键盘控制机械臂并记录位姿。
 - `connect_robot.py`：快速连接机械臂并打印当前状态。
@@ -62,7 +64,8 @@ sessions/
 - `wrist_camera/depth/`：wrist RealSense 深度图，uint16 PNG，单位毫米，已对齐 RGB。
 - `camera_metadata.json`：两台 RealSense 的 `848x480@30` profile、SDK 内参、畸变、序列号和 depth scale。
 - `robot_state/`：机械臂状态 JSON。
-- `pressure/`：压力数据 CSV。
+- `pressure/`：压力数据 CSV，仅保存标准 20 个有效触觉通道。
+- `sync/`：标准时间同步索引，由 `scripts/build_sync_index.py` 生成。
 
 旧版 `dji/` + `realsense_rgb/` + `realsense_depth/` 会话仍可由回放、标注和转换脚本读取。
 
@@ -90,6 +93,8 @@ python test_frequency.py --sensor wrist_camera --wrist-serial 0987654321
 
 - 录制期间调用 `rm_get_rm_plus_state_info()`，将夹爪实时状态写入 `robot_state/gripper_state.csv`。
 - 夹爪开合值记录为 `gripper_pos`，来源于 `dist["pos"][0]`。
+- 视觉帧保存频率为 `30Hz`，图像写盘和界面显示异步，保存性能优先。
+- 压力 CSV 只保存 `channel_config.py` 中定义的 20 个有效触觉通道，并保留 `sensor_timestamp_us` / `host_monotonic_us`。
 - 数据采集模块独立为 `collectors/` 包，每个采集器可单独调用。
 
 示例：
@@ -106,6 +111,23 @@ python collect_data.py --arm-host 172.25.5.243 --arm-port 8080 \
 - `--width` / `--height`：RGB 和深度流标准分辨率，默认 `848x480`。
 - `--rs-fps`：RealSense 设备标准采集 FPS，默认 `30`。
 - `--disable-gripper`：关闭夹爪状态采集。
+
+### 标准同步与历史压力数据裁剪
+
+正式转 RLDS 前先生成同步索引：
+
+```bash
+python scripts/build_sync_index.py --data-root sessions
+```
+
+历史压力 CSV 如仍为 64 通道格式，先 dry-run，再执行带备份裁剪：
+
+```bash
+python scripts/trim_pressure_channels.py --data-root sessions
+python scripts/trim_pressure_channels.py --data-root sessions --apply
+```
+
+执行后每个被裁剪的文件会保留 `pressure/pressure.full64.backup.csv`，并写入 `pressure/channel_trim_manifest.json`。
 
 ### `data_viwer.py`
 
@@ -198,9 +220,10 @@ python test.py
 ## 推荐工作流
 
 1. 先运行 `connect_robot.py` 或 `test.py`，确认机械臂可连接。
-2. 再用 `test_frequency.py --sensor dual_realsense` 检查两台 RealSense 是否能同时出 RGB-D。
+2. 再用 `test_frequency.py --sensor dual_realsense` 检查两台 RealSense 是否能同时出 30Hz RGB-D 帧对。
 3. 使用 `test_frequency.py --sensor pressure` 验证压力通信。
 4. 运行 `collect_data.py` 开始正式采集。
+5. 采集后运行 `scripts/build_sync_index.py`，再运行压力预处理和 RLDS 转换。
 
 ## 采集注意事项
 
