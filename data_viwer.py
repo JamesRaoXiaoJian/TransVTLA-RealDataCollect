@@ -28,6 +28,7 @@ from session_schema import (
 from channel_config import (
     LEFT_CHANNEL, RIGHT_CHANNEL,
     LEFT_MATRIX_CHANNELS, RIGHT_MATRIX_CHANNELS,
+    INTERPOLATE_CHANNELS,
 )
 
 BG_COLOR = QtCore.Qt.black
@@ -142,6 +143,12 @@ class PressureDashboard(QtWidgets.QWidget):
     def set_values(self, values: list[int]) -> None:
         if len(values) >= 64:
             self._values = list(values)
+            # 对 INTERPOLATE_CHANNELS 中标记的异常通道，用相邻通道均值替代
+            for bad_ch, adjacent_chs in INTERPOLATE_CHANNELS.items():
+                if 0 <= bad_ch - 1 < len(self._values):
+                    adj_vals = [self._values[c - 1] for c in adjacent_chs if 0 <= c - 1 < len(self._values)]
+                    if adj_vals:
+                        self._values[bad_ch - 1] = int(sum(adj_vals) / len(adj_vals))
             self.update()
 
     def set_state_info(self, text: str) -> None:
