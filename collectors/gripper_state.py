@@ -11,8 +11,8 @@ from Robotic_Arm.rm_robot_interface import RoboticArm, rm_thread_mode_e
 from collectors.robot_arm import DEFAULT_ARM_HOST, DEFAULT_ARM_PORT
 from timestamp_utils import get_timestamp_us
 
-GRIPPER_FPS = 100  # 目标频率，实际取决于 SDK 调用耗时
-GRIPPER_INTERVAL_S = 0.0  # 不额外 sleep，让 SDK 调用耗时决定节奏
+GRIPPER_FPS = 120  # 目标频率（SDK 实测 ~122Hz 自由运行）
+GRIPPER_INTERVAL_S = 0.0  # 不限速：与机械臂共享 SDK 连接，自由运行靠时间戳对齐
 GRIPPER_BATCH_SIZE = 100
 GRIPPER_FLUSH_INTERVAL_S = 0.1
 
@@ -131,7 +131,7 @@ class GripperStateCollector:
         return None
 
     def _poll_loop(self) -> None:
-        """轮询夹爪状态。添加时间戳去重（当前 110/306 session 有重复，占 ~60%）。"""
+        """轮询夹爪状态。SDK 自由运行 ~122Hz，靠时间戳对齐到 30Hz 视觉帧。"""
         last_timestamp_us = 0  # 去重：跳过相同时间戳
 
         while self.running:
@@ -188,8 +188,6 @@ class GripperStateCollector:
                     ]
                     self.row_buffer.append(row)
                     self._flush_locked(force=False)
-
-            # 不 sleep，让 SDK 调用耗时决定节奏
 
     def _flush_locked(self, force: bool) -> None:
         if not self.recording or self.csv_writer is None or self.csv_file is None:

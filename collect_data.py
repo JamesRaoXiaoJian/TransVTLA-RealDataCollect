@@ -1,19 +1,31 @@
 """Collect synchronized data from two RealSense RGB-D cameras, robot, pressure, and gripper state.
 
-Sampling rates:
-    - Visual (world RealSense + wrist RealSense): 30Hz
-    - Tactile/Pressure: 200Hz
-    - Robot Arm State: 100Hz
-    - Gripper RM Plus State: 100Hz target
+采样频率（基于实测）:
+    - Visual (world + wrist RealSense): 30 Hz — 主时钟，驱动对齐网格
+    - Robot Arm State: ~115 Hz — 原生采集，全量写盘
+    - Gripper RM Plus State: ~112 Hz — 原生采集，全量写盘
+    - Tactile/Pressure: ~70 Hz — 原生采集，全量写盘
+
+时间步对齐策略:
+    各传感器按自身最高频率独立采集写盘。录制结束后自动生成
+    `aligned_timesteps.csv`，将所有传感器数据按最近时间戳对齐到
+    30Hz 视觉帧上。每行包含：
+      - frame_id / visual_timestamp_us
+      - 机械臂最近邻数据 + 时间偏移 (ms)
+      - 夹爪最近邻数据 + 时间偏移 (ms)
+      - 压力传感器最近邻数据 + 时间偏移 (ms)
 
 Press SPACE to start/stop individual recording sessions. Each session creates a
 timestamped folder containing:
-    - `world_camera/rgb/`   : world RealSense RGB frames (30Hz)
-    - `world_camera/depth/` : world RealSense depth frames (30Hz, 16-bit PNG)
-    - `wrist_camera/rgb/`   : wrist RealSense RGB frames (30Hz)
-    - `wrist_camera/depth/` : wrist RealSense depth frames (30Hz, 16-bit PNG)
-    - `robot_state/`     : CSV robot arm state + gripper state
-    - `pressure/`        : CSV pressure samples at 200Hz
+    - `world_camera/rgb/`       : world RealSense RGB frames (30Hz)
+    - `world_camera/depth/`     : world RealSense depth frames (30Hz, 16-bit PNG)
+    - `wrist_camera/rgb/`       : wrist RealSense RGB frames (30Hz)
+    - `wrist_camera/depth/`     : wrist RealSense depth frames (30Hz, 16-bit PNG)
+    - `robot_state/robot_state.csv`   : robot arm state (~115Hz, with timestamps)
+    - `robot_state/gripper_state.csv` : gripper RM Plus state (~112Hz, with timestamps)
+    - `pressure/pressure.csv`         : pressure samples (~70Hz, with timestamps)
+    - `frames.csv`                    : visual frame save log
+    - `aligned_timesteps.csv`         : 30Hz 对齐索引（训练用）
 
 Use Q or ESC to exit at any time.
 """
@@ -71,6 +83,7 @@ FRAME_SAVE_QUEUE_SIZE = 180
 from channel_config import (
     LEFT_CHANNEL, RIGHT_CHANNEL,
     LEFT_MATRIX_CHANNELS, RIGHT_MATRIX_CHANNELS,
+    INTERPOLATE_CHANNELS,
 )
 
 
@@ -329,6 +342,12 @@ class PressureDashboard(QtWidgets.QWidget):
     def set_values(self, values: list[int]) -> None:
         if len(values) >= 64:
             self._values = list(values)
+            # 对 INTERPOLATE_CHANNELS 中标记的异常通道，用相邻通道均值替代
+            for bad_ch, adjacent_chs in INTERPOLATE_CHANNELS.items():
+                if 0 <= bad_ch - 1 < len(self._values):
+                    adj_vals = [self._values[c - 1] for c in adjacent_chs if 0 <= c - 1 < len(self._values)]
+                    if adj_vals:
+                        self._values[bad_ch - 1] = int(sum(adj_vals) / len(adj_vals))
             self.update()
 
     def set_state_info(self, text: str) -> None:
@@ -497,6 +516,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session_paths: SessionPaths | None = None
         self.frame_id = 0
         self.save_worker: FrameSaveWorker | None = None
+        self._session_counts = self._count_sessions()
 
         self._build_ui()
         self._start_collectors()
@@ -571,6 +591,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self.gripper.stop()
         self.pressure.stop()
 
+    def _count_sessions(self) -> tuple[int, int]:
+        """统计 session 数量: (total, today)."""
+        output_dir = self.args.output
+        if not output_dir.exists():
+            return 0, 0
+        today_str = datetime.now().strftime("%Y%m%d")
+        total = 0
+        today = 0
+        prefix = self.args.session_prefix
+        for d in output_dir.iterdir():
+            if d.is_dir() and d.name.startswith(f"{prefix}_"):
+                total += 1
+                if today_str in d.name:
+                    today += 1
+        return total, today
+
     # ---- Recording toggle ----
 
     def _start_recording(self) -> None:
@@ -618,6 +654,10 @@ class MainWindow(QtWidgets.QMainWindow):
             max_q = self.save_worker.max_queue_depth
             self.save_worker = None
 
+        # 生成时间步对齐索引
+        if self.session_paths is not None:
+            self._generate_alignment_index(self.session_paths)
+
         self.session_paths = None
         self.frame_id = 0
         self.recording = False
@@ -627,6 +667,262 @@ class MainWindow(QtWidgets.QMainWindow):
             f"failed_writes={failed}, max_save_queue={max_q}. "
             "Press SPACE to start a new session."
         )
+
+    # ---- Alignment index generation ----
+
+    @staticmethod
+    def _read_sensor_csv(
+        path: Path, ts_col_names: tuple[str, ...] = ("host_monotonic_us", "capture_monotonic_us", "timestamp_us"),
+    ) -> tuple[list[str], list[int], list[list[str]]]:
+        """读取传感器 CSV，返回 (header, 时间戳列表, 数据行列表)。"""
+        if not path.exists():
+            return [], [], []
+        with open(path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if header is None:
+                return [], [], []
+            ts_col = None
+            for name in ts_col_names:
+                if name in header:
+                    ts_col = header.index(name)
+                    break
+            if ts_col is None:
+                ts_col = 0
+            timestamps: list[int] = []
+            rows: list[list[str]] = []
+            for row in reader:
+                if len(row) <= ts_col:
+                    continue
+                try:
+                    ts = int(row[ts_col])
+                except ValueError:
+                    continue
+                timestamps.append(ts)
+                rows.append(row)
+        return header, timestamps, rows
+
+    @staticmethod
+    def _find_bracket(sorted_ts: list[int], target: int) -> tuple[int, int]:
+        """查找 target 两侧的索引 (lo, hi)。lo=hi 表示 target 恰好命中或在边界。"""
+        import bisect
+        idx = bisect.bisect_left(sorted_ts, target)
+        if idx <= 0:
+            return 0, 0
+        if idx >= len(sorted_ts):
+            last = len(sorted_ts) - 1
+            return last, last
+        return idx - 1, idx
+
+    @staticmethod
+    def _try_float(s: str) -> float | None:
+        """尝试转 float，失败返回 None。"""
+        try:
+            return float(s)
+        except (ValueError, TypeError):
+            return None
+
+    def _interpolate_row(
+        self,
+        ts_lo: int, row_lo: list[str],
+        ts_hi: int, row_hi: list[str],
+        target_ts: int,
+        data_cols: list[int],
+    ) -> list[str]:
+        """线性插值：在 row_lo 和 row_hi 之间按 target_ts 插值。"""
+        if ts_lo == ts_hi:
+            return [row_lo[ci] if ci < len(row_lo) else "" for ci in data_cols]
+        alpha = (target_ts - ts_lo) / (ts_hi - ts_lo)
+        result: list[str] = []
+        for ci in data_cols:
+            v_lo = self._try_float(row_lo[ci]) if ci < len(row_lo) else None
+            v_hi = self._try_float(row_hi[ci]) if ci < len(row_hi) else None
+            if v_lo is not None and v_hi is not None:
+                result.append(f"{v_lo + alpha * (v_hi - v_lo):.6f}")
+            elif v_lo is not None:
+                result.append(row_lo[ci])
+            elif v_hi is not None:
+                result.append(row_hi[ci])
+            else:
+                result.append("")
+        return result
+
+    @staticmethod
+    def _zoh_row(row: list[str], data_cols: list[int]) -> list[str]:
+        """零阶保持（前值填充）：直接取 row 中 data_cols 列的值。"""
+        return [row[ci] if ci < len(row) else "" for ci in data_cols]
+
+    def _generate_alignment_index(self, session_paths: SessionPaths) -> None:
+        """生成 aligned_timesteps.csv：每行一个 30Hz 视觉帧，对齐所有传感器数据。
+
+        对齐策略:
+          - 机械臂: 线性插值（连续信号: 关节角度、位姿）
+          - 夹爪: 线性插值（连续信号: 位置 0-1000、速度、电流、力）
+          - 压力传感器: 线性插值（连续信号: 力/压力值）
+        """
+        frames_csv = session_paths.root / "frames.csv"
+        if not frames_csv.exists():
+            print("Alignment skipped: frames.csv not found.")
+            return
+
+        # 1. 读取视觉帧时间戳
+        visual_ts: list[int] = []
+        with open(frames_csv, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if header is None:
+                return
+            ts_col = header.index("capture_monotonic_us") if "capture_monotonic_us" in header else 1
+            for row in reader:
+                try:
+                    visual_ts.append(int(row[ts_col]))
+                except (ValueError, IndexError):
+                    continue
+
+        if not visual_ts:
+            print("Alignment skipped: no visual frames recorded.")
+            return
+
+        # 2. 读取各传感器 CSV
+        robot_path = session_paths.root / "robot_state" / "robot_state.csv"
+        gripper_path = session_paths.root / "robot_state" / "gripper_state.csv"
+        pressure_path = session_paths.root / "pressure" / "pressure.csv"
+
+        robot_header, robot_ts, robot_rows = self._read_sensor_csv(robot_path)
+        gripper_header, gripper_ts, gripper_rows = self._read_sensor_csv(gripper_path)
+        pressure_header, pressure_ts, pressure_rows = self._read_sensor_csv(
+            pressure_path, ts_col_names=("host_monotonic_us", "sensor_timestamp_us", "timestamp_us"),
+        )
+
+        # 3. 确定各传感器数据列索引（跳过时间戳列）
+        robot_ts_cols = {robot_header.index(c) for c in ("timestamp_us",) if c in robot_header}
+        robot_data_cols = [i for i in range(len(robot_header)) if i not in robot_ts_cols]
+
+        gripper_ts_cols = {gripper_header.index(c) for c in ("timestamp_us",) if c in gripper_header}
+        gripper_data_cols = [i for i in range(len(gripper_header)) if i not in gripper_ts_cols]
+
+        pressure_ts_cols = {
+            pressure_header.index(c)
+            for c in ("sensor_timestamp_us", "host_monotonic_us")
+            if c in pressure_header
+        }
+        pressure_data_cols = [i for i in range(len(pressure_header)) if i not in pressure_ts_cols]
+
+        # 4. 构建对齐表 header
+        aligned_header = ["frame_id", "visual_timestamp_us"]
+
+        aligned_header += ["robot_timestamp_us", "robot_offset_ms"]
+        aligned_header += [f"robot_{robot_header[i]}" for i in robot_data_cols]
+
+        aligned_header += ["gripper_timestamp_us", "gripper_offset_ms"]
+        aligned_header += [f"gripper_{gripper_header[i]}" for i in gripper_data_cols]
+
+        aligned_header += ["pressure_timestamp_us", "pressure_offset_ms"]
+        aligned_header += [f"pressure_{pressure_header[i]}" for i in pressure_data_cols]
+
+        # 5. 逐帧对齐
+        robot_offsets: list[float] = []
+        gripper_offsets: list[float] = []
+        pressure_offsets: list[float] = []
+
+        aligned_path = session_paths.root / "aligned_timesteps.csv"
+        with open(aligned_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(aligned_header)
+
+            for frame_id, vts in enumerate(visual_ts):
+                row_out: list[str] = [frame_id, vts]
+
+                # --- 机械臂: 线性插值 ---
+                if robot_ts:
+                    lo, hi = self._find_bracket(robot_ts, vts)
+                    # 用 lo 和 hi 的中点时间戳作为对齐时间戳
+                    ref_ts = robot_ts[lo] if lo == hi else robot_ts[lo]
+                    offset_ms = (ref_ts - vts) / 1000.0
+                    robot_offsets.append(abs(offset_ms))
+                    row_out += [ref_ts, f"{offset_ms:.3f}"]
+                    if lo == hi:
+                        row_out += self._zoh_row(robot_rows[lo], robot_data_cols)
+                    else:
+                        row_out += self._interpolate_row(
+                            robot_ts[lo], robot_rows[lo],
+                            robot_ts[hi], robot_rows[hi],
+                            vts, robot_data_cols,
+                        )
+                else:
+                    row_out += ["", ""] + [""] * len(robot_data_cols)
+
+                # --- 夹爪: 线性插值（位置 0-1000、速度、电流、力均为连续值）---
+                if gripper_ts:
+                    lo, hi = self._find_bracket(gripper_ts, vts)
+                    ref_ts = gripper_ts[lo] if lo == hi else gripper_ts[lo]
+                    offset_ms = (ref_ts - vts) / 1000.0
+                    gripper_offsets.append(abs(offset_ms))
+                    row_out += [ref_ts, f"{offset_ms:.3f}"]
+                    if lo == hi:
+                        row_out += self._zoh_row(gripper_rows[lo], gripper_data_cols)
+                    else:
+                        row_out += self._interpolate_row(
+                            gripper_ts[lo], gripper_rows[lo],
+                            gripper_ts[hi], gripper_rows[hi],
+                            vts, gripper_data_cols,
+                        )
+                else:
+                    row_out += ["", ""] + [""] * len(gripper_data_cols)
+
+                # --- 压力传感器: 线性插值 ---
+                if pressure_ts:
+                    lo, hi = self._find_bracket(pressure_ts, vts)
+                    ref_ts = pressure_ts[lo] if lo == hi else pressure_ts[lo]
+                    offset_ms = (ref_ts - vts) / 1000.0
+                    pressure_offsets.append(abs(offset_ms))
+                    row_out += [ref_ts, f"{offset_ms:.3f}"]
+                    if lo == hi:
+                        row_out += self._zoh_row(pressure_rows[lo], pressure_data_cols)
+                    else:
+                        row_out += self._interpolate_row(
+                            pressure_ts[lo], pressure_rows[lo],
+                            pressure_ts[hi], pressure_rows[hi],
+                            vts, pressure_data_cols,
+                        )
+                else:
+                    row_out += ["", ""] + [""] * len(pressure_data_cols)
+
+                writer.writerow(row_out)
+
+        # 6. 输出对齐质量统计
+        n_visual = len(visual_ts)
+        n_robot = len(robot_ts)
+        n_gripper = len(gripper_ts)
+        n_pressure = len(pressure_ts)
+        elapsed_s = (visual_ts[-1] - visual_ts[0]) / 1e6
+
+        print(f"Alignment index saved: {aligned_path}")
+        print(f"  Visual frames: {n_visual} ({n_visual / elapsed_s:.1f}Hz)")
+        print(f"  Robot samples: {n_robot} ({n_robot / elapsed_s:.1f}Hz)")
+        print(f"  Gripper samples: {n_gripper} ({n_gripper / elapsed_s:.1f}Hz)")
+        print(f"  Pressure samples: {n_pressure} ({n_pressure / elapsed_s:.1f}Hz)")
+
+        def _report_offsets(name: str, offsets: list[float]) -> None:
+            if not offsets:
+                print(f"  {name}: no data")
+                return
+            offsets_sorted = sorted(offsets)
+            n = len(offsets_sorted)
+            mean = sum(offsets_sorted) / n
+            p95_idx = min(int(n * 0.95), n - 1)
+            p95 = offsets_sorted[p95_idx]
+            max_off = offsets_sorted[-1]
+            over_10ms = sum(1 for o in offsets if o > 10.0)
+            print(
+                f"  {name} alignment: mean={mean:.2f}ms, p95={p95:.2f}ms, "
+                f"max={max_off:.2f}ms, >10ms={over_10ms}/{n}"
+            )
+
+        print("  Alignment quality (absolute offsets):")
+        _report_offsets("Robot", robot_offsets)
+        _report_offsets("Gripper", gripper_offsets)
+        _report_offsets("Pressure", pressure_offsets)
 
     # ---- Timer callback (30Hz) ----
 
@@ -649,8 +945,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 f" | SaveQ: {self.save_worker.queue.qsize()}"
                 f" | Drop: {self.save_worker.dropped_tasks}"
             )
+        # 更新 session 计数（每次录制停止后刷新）
+        if not self.recording:
+            self._session_counts = self._count_sessions()
+        total, today = self._session_counts
+        if self.recording:
+            total += 1
+            today += 1
         self.status_label.setText(
-            f"Status: {status} | Frames: {self.frame_id if self.recording else 0}{queue_text}"
+            f"Status: {status} | Frames: {self.frame_id if self.recording else 0} | "
+            f"Total: {total} | Today: {today}{queue_text}"
         )
 
         # Robot + gripper state → dashboard

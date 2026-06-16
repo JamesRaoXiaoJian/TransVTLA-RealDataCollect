@@ -76,6 +76,10 @@ class RealSenseRGB:
             return []
         return devices
 
+    # 固定的相机序列号映射（物理安装位置确定后写死）
+    DEFAULT_WORLD_SERIAL = "342522071842"
+    DEFAULT_WRIST_SERIAL = "347622074824"
+
     @staticmethod
     def resolve_serial_pair(
         world_serial: str | None = None,
@@ -87,10 +91,19 @@ class RealSenseRGB:
         if world_serial and wrist_serial and world_serial == wrist_serial:
             raise ValueError("world and wrist RealSense serial numbers must be different.")
 
+        # 未指定时使用固定默认值
         if world_serial is None:
-            world_serial = next((serial for serial in serials if serial != wrist_serial), None)
+            world_serial = RealSenseRGB.DEFAULT_WORLD_SERIAL
         if wrist_serial is None:
-            wrist_serial = next((serial for serial in serials if serial != world_serial), None)
+            wrist_serial = RealSenseRGB.DEFAULT_WRIST_SERIAL
+
+        # 验证设备是否在线
+        if world_serial not in serials:
+            print(f"Warning: world camera {world_serial} not found in detected devices.")
+            world_serial = None
+        if wrist_serial not in serials:
+            print(f"Warning: wrist camera {wrist_serial} not found in detected devices.")
+            wrist_serial = None
 
         return world_serial, wrist_serial, devices
 
@@ -158,9 +171,11 @@ class RealSenseRGB:
                 color_sensor.set_option(rs.option.enable_auto_exposure, 0)
             if color_sensor.supports(rs.option.enable_auto_white_balance):
                 color_sensor.set_option(rs.option.enable_auto_white_balance, 0)
-            # 手动曝光（根据环境光调整）
+            # 手动曝光（D435 color sensor, unit ~0.1ms; 100 ≈ 10ms, 30fps 下留 23ms 余量）
             if color_sensor.supports(rs.option.exposure):
-                color_sensor.set_option(rs.option.exposure, 8.0)  # 8ms
+                color_sensor.set_option(rs.option.exposure, 100.0)  # ~10ms
+            if color_sensor.supports(rs.option.gain):
+                color_sensor.set_option(rs.option.gain, 64.0)  # 默认增益
         except Exception:
             pass
 
