@@ -1,32 +1,58 @@
 # TransVTLA-RealDataCollect
 
-面向 **机械臂 + 双 RealSense RGB-D 相机 + 压力传感器** 的多模态数据采集项目。
+面向 **机械臂 + 双 RealSense RGB-D 相机 + 触觉/压力传感器 + 夹爪状态** 的多模态真机数据采集、清洗、回放和数据工程仓库。
 
-这个仓库的目标是把采集、回放、调试和机械臂交互整理成一套脚本工具，方便在实验现场快速记录同步数据，并在采集完成后离线检查每个 session。
+## 数据工程展示
 
-## 项目内容
+![数据工程策略与当前概览](data-engineering-ppt/exports/slide-1-data-strategy.png)
 
-- **Intel RealSense RGB-D 相机 x2**：分别作为 world camera 和 wrist camera，同时采集 RGB 与深度图。
-- **睿尔曼机械臂**：采集当前位姿、关节状态和软件状态。
-- **压力数据**：通过 UDP 接收下位机发送的数据包并保存为 CSV。
+![四任务采集/回放视图矩阵](data-engineering-ppt/exports/slide-2-task-views.png)
 
-## 目录说明
+## 项目定位
 
-- `Robotic_Arm/`：机械臂 Python SDK，本仓库已内置。
-- `collect_data.py`：多模态数据采集主程序（双 RealSense RGB-D + 机械臂 + 压力 + 夹爪），PySide6 界面。
-- `test_frequency.py`：逐项测试压力、机械臂、夹爪和双 RealSense 的采集频率。
-- `data_viwer.py`：离线浏览已采集 session 的工具。
-- `calibration/world_realsense_calibration.py`：固定 world RealSense 相机到机械臂基座的外参标定。
-- `calibration/hand_eye_calibration.py`：wrist RealSense 手眼标定，读取标准 profile 下的 SDK 内参。
-- `scripts/build_sync_index.py`：为每个 session 生成标准多模态时间同步索引。
-- `scripts/trim_pressure_channels.py`：备份并裁剪历史压力 CSV，只保留标准 20 个触觉通道。
-- `Phase2_build_RLDSdata.py`：把采集 session 转换为 RGB-D RLDS/TFDS 数据。
-- `keybordControl.py`：键盘控制机械臂并记录位姿。
-- `connect_robot.py`：快速连接机械臂并打印当前状态。
+本仓库把实验现场的数据采集、频率检查、离线回放、数据清洗、任务划分和 RLDS/TFDS 转换整理成一套可复用工具链。
 
-## 环境依赖
+当前数据工程展示口径：
 
-建议使用 Python 虚拟环境，并安装以下依赖：
+| 数据轨道 | 数量 | 覆盖内容 | 对齐目标 |
+| --- | ---: | --- | --- |
+| 真机数据 | 1,000 条轨迹 | 外部/腕部 RGB-D、触觉、机械臂、夹爪 | 真实采集与回放 |
+| 仿真数据 | 10,000 条轨迹 | 同任务标签、同传感器结构 | 尽量对齐真机 schema 与视角 |
+| 任务视图 | 4 类任务 | 放入盒子、复杂盒子/烧杯、烧杯三脚架、试管架 | 训练与评估划分 |
+
+四个任务的展示配额：
+
+| 任务 | 真机轨迹 | 仿真轨迹 |
+| --- | ---: | ---: |
+| T1 简单放入盒子 | 400 | 4,000 |
+| T2 复杂盒子/烧杯 | 220 | 2,200 |
+| T3 烧杯放置三脚架 | 180 | 1,800 |
+| T4 试管插入试管架 | 200 | 2,000 |
+
+## 快速入口
+
+### 网页 PPT
+
+```bash
+cd data-engineering-ppt
+npm install
+npm run react
+```
+
+访问：
+
+- 首页：`http://localhost:5178/`
+- 第二页：`http://localhost:5178/?slide=2`
+- 导出模式：`http://localhost:5178/?slide=1&export=1`
+
+已导出的高清 PNG：
+
+- `data-engineering-ppt/exports/slide-1-data-strategy.png`
+- `data-engineering-ppt/exports/slide-2-task-views.png`
+
+### Python 环境
+
+建议使用 Python 虚拟环境，并安装基础依赖：
 
 ```bash
 pip install opencv-python numpy keyboard
@@ -35,203 +61,166 @@ pip install pyrealsense2
 
 说明：
 
-- `pyrealsense2` 需要根据你的 RealSense 驱动和 Python 版本安装。
-- 机械臂相关脚本依赖本仓库内的 `Robotic_Arm` 包。
+- `pyrealsense2` 需要匹配本机 RealSense 驱动和 Python 版本。
+- 机械臂相关脚本依赖仓库内置的 `Robotic_Arm/` SDK。
+- GUI 采集和回放脚本依赖 PySide6。
 
-## 数据输出结构
+## 核心能力
 
-常见采集结果会按时间戳创建 session，例如：
+- 双 RealSense RGB-D 同步采集：外部视角与腕部视角同时保存 RGB 和 depth。
+- 机械臂状态采集：记录关节角度、末端位姿和软件状态。
+- 夹爪状态采集：读取 RM Plus 官方状态接口，记录位置、速度、电流、力和错误码。
+- 触觉/压力采集：标准化为 20 个有效触觉通道。
+- 离线回放：按帧查看外部 RGB-D、腕部 RGB-D、机械臂状态、夹爪状态和触觉数据。
+- 数据清洗：通道裁剪、CH58 插值、时间戳排序、夹爪去重、对齐表重建。
+- 数据划分：按硬件视角和任务标签生成 manifest 与 symlink view。
+- 数据导出：支持 RGB-D RLDS/TFDS 转换入口。
+
+## 目录说明
+
+| 路径 | 说明 |
+| --- | --- |
+| `collect_data.py` | 真机多模态采集主程序，包含 PySide6 采集界面 |
+| `data_viwer.py` | 离线 session 回放工具 |
+| `test_frequency.py` | 采集前频率检查工具 |
+| `collectors/` | 相机、机械臂、夹爪、压力等采集器封装 |
+| `Robotic_Arm/` | 睿尔曼机械臂 Python SDK |
+| `scripts/audit_dataset.py` | 数据集审计，检查模态、频率、时间戳和同步问题 |
+| `scripts/clean_dataset.py` | 数据清洗与对齐重建 |
+| `scripts/materialize_split_layout.py` | 按硬件 split 生成非破坏性视图 |
+| `scripts/materialize_task_splits.py` | 按任务标签生成四任务视图 |
+| `scripts/build_task_preview_sheets.py` | 生成任务标注用 contact sheets |
+| `Phase2_build_RLDSdata.py` | 将采集 session 转换为 RLDS/TFDS |
+| `calibration/` | 相机外参、手眼标定和诊断脚本 |
+| `docs/` | 数据格式、采集优化和修复计划文档 |
+| `data-engineering-ppt/` | 两页数据工程网页 PPT 与高清导出图 |
+
+## 数据结构
+
+标准真机 session 通常形如：
 
 ```text
 sessions/
-	session_YYYYMMDD_HHMMSS/
-		world_camera/
-			rgb/
-			depth/
-		wrist_camera/
-			rgb/
-			depth/
-		camera_metadata.json
-		robot_state/
-		pressure/
+  session_YYYYMMDD_HHMMSS/
+    world_camera/
+      rgb/
+      depth/
+    wrist_camera/
+      rgb/
+      depth/
+    camera_metadata.json
+    frames.csv
+    aligned_timesteps.csv
+    robot_state/
+      robot_state.csv
+      gripper_state.csv
+    pressure/
+      pressure.csv
 ```
 
-不同脚本保存的内容略有差异：
+关键模态：
 
-- `world_camera/rgb/`：world RealSense RGB 图像帧。
-- `world_camera/depth/`：world RealSense 深度图，uint16 PNG，单位毫米，已对齐 RGB。
-- `wrist_camera/rgb/`：wrist RealSense RGB 图像帧。
-- `wrist_camera/depth/`：wrist RealSense 深度图，uint16 PNG，单位毫米，已对齐 RGB。
-- `camera_metadata.json`：两台 RealSense 的 `848x480@30` profile、SDK 内参、畸变、序列号和 depth scale。
-- `robot_state/`：机械臂状态 JSON。
-- `pressure/`：压力数据 CSV，仅保存标准 20 个有效触觉通道。
-- `sync/`：标准时间同步索引，由 `scripts/build_sync_index.py` 生成。
+- `world_camera/rgb/`：外部 RealSense RGB 图像。
+- `world_camera/depth/`：外部 RealSense 深度图，`uint16 PNG`，单位毫米。
+- `wrist_camera/rgb/`：腕部 RealSense RGB 图像。
+- `wrist_camera/depth/`：腕部 RealSense 深度图，`uint16 PNG`，单位毫米。
+- `frames.csv`：视觉帧采集时间戳。
+- `aligned_timesteps.csv`：视觉、触觉、机械臂和夹爪的对齐索引。
+- `camera_metadata.json`：双 RealSense 的 profile、内参、畸变、序列号和 depth scale。
+- `robot_state/robot_state.csv`：机械臂关节和末端位姿。
+- `robot_state/gripper_state.csv`：夹爪实时状态。
+- `pressure/pressure.csv`：标准 20 通道触觉数据。
 
-旧版 `dji/` + `realsense_rgb/` + `realsense_depth/` 会话仍可由回放、标注和转换脚本读取。
+旧版 `dji/` + `realsense_rgb/` + `realsense_depth/` 会话仍可由回放、审计和转换脚本读取。
 
-RLDS/TFDS 转换会输出 `primary_image`、`wrist_image`、`primary_depth`、`wrist_depth`。两路深度为 `uint16`，形状 `224x224x1`，单位毫米。
+## 常用脚本
 
-## 脚本说明与用法
-
-### `test_frequency.py`
-
-用途：正式采集前检查各传感器和两台 RealSense 同时运行时的实际频率。
-
-常用示例：
+### 采集前频率检查
 
 ```bash
 python test_frequency.py --sensor dual_realsense --duration 30
-python test_frequency.py --sensor world_camera --world-serial 1234567890
-python test_frequency.py --sensor wrist_camera --wrist-serial 0987654321
+python test_frequency.py --sensor pressure
+python test_frequency.py --sensor robot
 ```
 
-### `collect_data.py`
-
-用途：采集 world/wrist 两台 RealSense 的 RGB-D 数据 + 机械臂状态 + 压力 UDP 数据 + 夹爪官方状态 API 数据。
-
-新增内容：
-
-- 录制期间调用 `rm_get_rm_plus_state_info()`，将夹爪实时状态写入 `robot_state/gripper_state.csv`。
-- 夹爪开合值记录为 `gripper_pos`，来源于 `dist["pos"][0]`。
-- 视觉帧保存频率为 `30Hz`，图像写盘和界面显示异步，保存性能优先。
-- 压力 CSV 只保存 `channel_config.py` 中定义的 20 个有效触觉通道，并保留 `sensor_timestamp_us` / `host_monotonic_us`。
-- 数据采集模块独立为 `collectors/` 包，每个采集器可单独调用。
-
-示例：
+### 真机多模态采集
 
 ```bash
-python collect_data.py --arm-host 172.25.5.243 --arm-port 8080 \
-  --world-serial 1234567890 --wrist-serial 0987654321
+python collect_data.py \
+  --arm-host 172.25.5.243 \
+  --arm-port 8080 \
+  --world-serial 1234567890 \
+  --wrist-serial 0987654321
 ```
 
 常用参数：
 
-- `--world-serial`：world RealSense 序列号；不填时会从已连接设备自动选择。
-- `--wrist-serial`：wrist RealSense 序列号；不填时会从已连接设备自动选择。
-- `--width` / `--height`：RGB 和深度流标准分辨率，默认 `848x480`。
-- `--rs-fps`：RealSense 设备标准采集 FPS，默认 `30`。
+- `--world-serial`：外部 RealSense 序列号。
+- `--wrist-serial`：腕部 RealSense 序列号。
+- `--width` / `--height`：RGB 和深度分辨率，默认 `848x480`。
+- `--rs-fps`：RealSense 采集 FPS，默认 `30`。
 - `--disable-gripper`：关闭夹爪状态采集。
 
-### 标准同步与历史压力数据裁剪
-
-正式转 RLDS 前先生成同步索引：
-
-```bash
-python scripts/build_sync_index.py --data-root sessions
-```
-
-历史压力 CSV 如仍为 64 通道格式，先 dry-run，再执行带备份裁剪：
-
-```bash
-python scripts/trim_pressure_channels.py --data-root sessions
-python scripts/trim_pressure_channels.py --data-root sessions --apply
-```
-
-执行后每个被裁剪的文件会保留 `pressure/pressure.full64.backup.csv`，并写入 `pressure/channel_trim_manifest.json`。
-
-### `data_viwer.py`
-
-用途：离线浏览 `sessions/` 下的采集结果。
-
-浏览方式：
-
-- 使用滑块切换帧。
-- 使用左右方向键前后切换。
-- `Q` 或 `ESC` 退出。
-
-示例：
+### 离线回放
 
 ```bash
 python data_viwer.py --sessions sessions
 python data_viwer.py --sessions sessions --session session_20260429_120000
 ```
 
-### `pressure_data.py`
+回放操作：
 
-用途：接收压力 UDP 数据并保存到 CSV 文件。
+- 左右方向键切换帧。
+- 滑块定位帧。
+- `Q` 或 `ESC` 退出。
 
-它会：
-
-- 向下位机发送一次 `HELLO` 握手。
-- 持续监听 UDP 数据包。
-- 定期把 `left/right` 压力值写入 `pressure_logs/`。
-
-示例：
+### 数据审计与清洗
 
 ```bash
-python pressure_data.py
+python scripts/audit_dataset.py
+python scripts/clean_dataset.py
+python scripts/clean_dataset.py --apply
 ```
 
-### `herong_9_pressure_data.py`
+清洗内容包括：
 
-用途：在终端内实时显示 64 路压力通道数据。
+- 历史 64 通道压力 CSV 裁剪为标准 20 通道。
+- CH58 使用相邻通道均值插值替代。
+- 非单调时间戳排序。
+- 夹爪重复时间戳去重。
+- dual-RealSense `aligned_timesteps.csv` 重建。
 
-特点：
-
-- 不会持续刷屏，而是原地刷新固定区域。
-- 适合现场快速查看压力数据是否正常。
-
-示例：
+### 任务视图生成
 
 ```bash
-python herong_9_pressure_data.py
+python scripts/build_task_preview_sheets.py
+python scripts/materialize_task_splits.py
 ```
 
-### `keybordControl.py`
+生成结果包含：
 
-用途：键盘控制机械臂，并高频记录位姿到 `pose_logs/`。
-
-默认按键：
-
-- `W` / `↑`：Z 轴正方向。
-- `S` / `↓`：Z 轴负方向。
-- `A` / `←`：Y 轴正方向。
-- `D` / `→`：Y 轴负方向。
-- `Q`：X 轴正方向。
-- `E`：X 轴负方向。
-- `ESC`：退出并保存日志。
-
-示例：
-
-```bash
-python keybordControl.py
-```
-
-### `connect_robot.py`
-
-用途：最小化的机械臂连接示例，适合先验证 IP、端口和 SDK 是否可用。
-
-示例：
-
-```bash
-python connect_robot.py
-```
-
-### `test.py`
-
-用途：机械臂 SDK 的调试脚本，会打印软件信息和当前位姿。
-
-示例：
-
-```bash
-python test.py
-```
+- `dataset/task_review/previews/`
+- `dataset/task_splits/task_session_manifest.csv`
+- `dataset/task_splits/by_task/`
+- `dataset/task_splits/by_hardware_split/`
 
 ## 推荐工作流
 
-1. 先运行 `connect_robot.py` 或 `test.py`，确认机械臂可连接。
-2. 再用 `test_frequency.py --sensor dual_realsense` 检查两台 RealSense 是否能同时出 30Hz RGB-D 帧对。
-3. 使用 `test_frequency.py --sensor pressure` 验证压力通信。
-4. 运行 `collect_data.py` 开始正式采集。
-5. 采集后运行 `scripts/build_sync_index.py`，再运行压力预处理和 RLDS 转换。
+1. 运行 `connect_robot.py` 或 `test.py`，确认机械臂连接正常。
+2. 运行 `test_frequency.py --sensor dual_realsense`，确认双 RealSense 同时工作。
+3. 运行 `test_frequency.py --sensor pressure`，确认触觉数据正常。
+4. 运行 `collect_data.py` 进行正式采集。
+5. 采集后运行 `scripts/audit_dataset.py` 和 `scripts/clean_dataset.py`。
+6. 生成任务划分和回放视图。
+7. 需要训练数据时，再执行 RLDS/TFDS 转换。
 
-## 采集注意事项
+## 注意事项
 
-- 请确认两台 RealSense、压力下位机和机械臂的 IP / 端口配置正确。
-- 采集前建议先用序列号绑定 world/wrist 两台相机，避免设备枚举顺序变化。
-- 压力脚本依赖下位机发送符合 `<Q64h>` 格式的数据包。
-- `sessions/`、`pose_logs/`、`pressure_logs/`、`sample_output/` 等目录属于运行输出，通常不需要提交到 Git。
+- 采集前固定两台 RealSense 的序列号，避免设备枚举顺序变化。
+- 触觉下位机数据包需符合采集脚本约定格式。
+- `dataset/`、`sessions/`、`pose_logs/`、`pressure_logs/`、`sample_output/` 等目录属于运行输出，默认不提交。
+- 网页 PPT 的 `node_modules/` 和 `dist/` 不提交，只保留源码、素材和导出图。
 
 ## 许可证与说明
 
-本仓库包含机械臂二次开发相关代码和数据采集脚本，适合实验环境下的数据同步采集与调试。
+本仓库包含实验环境下的数据同步采集、机械臂控制和数据工程脚本。使用前请根据现场设备 IP、序列号、端口和驱动版本进行配置。
