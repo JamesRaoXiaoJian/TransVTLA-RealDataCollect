@@ -63,6 +63,36 @@ count_files() {
     fi
 }
 
+count_real_schema_sessions() {
+    local dir="$1"
+    if [[ -d "$dir" ]]; then
+        find "$dir" -mindepth 1 -maxdepth 1 -type d -name 'session_ep*_env*' |
+            while IFS= read -r session_dir; do
+                [[ -s "$session_dir/frames.csv" ]] && basename "$session_dir"
+            done |
+            wc -l |
+            tr -d ' '
+    else
+        printf '0'
+    fi
+}
+
+count_real_schema_episodes() {
+    local dir="$1"
+    if [[ -d "$dir" ]]; then
+        find "$dir" -mindepth 1 -maxdepth 1 -type d -name 'session_ep*_env*' |
+            while IFS= read -r session_dir; do
+                [[ -s "$session_dir/frames.csv" ]] && basename "$session_dir"
+            done |
+            sed -E 's/^session_ep([0-9]+)_env[0-9]+$/\1/' |
+            sort -u |
+            wc -l |
+            tr -d ' '
+    else
+        printf '0'
+    fi
+}
+
 percent() {
     local done="$1"
     local total="$2"
@@ -129,7 +159,11 @@ done
 [[ "$TAIL_LINES" =~ ^[0-9]+$ ]] || die "--tail-lines must be an integer"
 
 cd "$ISAAC_ROOT"
-OUTPUT_PATH="$ISAAC_ROOT/$OUTPUT_DIR"
+if [[ "$OUTPUT_DIR" = /* ]]; then
+    OUTPUT_PATH="$OUTPUT_DIR"
+else
+    OUTPUT_PATH="$ISAAC_ROOT/$OUTPUT_DIR"
+fi
 SCREEN_LIST="$(screen -ls 2>/dev/null || true)"
 
 printf 'Franka collection progress\n'
@@ -146,9 +180,17 @@ fi
 
 if ((SHOW_GPU)) && command -v nvidia-smi >/dev/null 2>&1; then
     printf '\nGPU summary:\n'
-    nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu \
-        --format=csv,noheader,nounits |
-        awk -F', ' '{ printf "  gpu%s %s: util=%s%% mem=%s/%s MiB power=%s W temp=%s C\n", $1, $2, $3, $4, $5, $6, $7 }'
+    gpu_summary="$(
+        nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu \
+            --format=csv,noheader,nounits 2>&1
+    )" || {
+        printf '  nvidia-smi query failed: %s\n' "$(printf '%s\n' "$gpu_summary" | head -n 1)"
+        gpu_summary=""
+    }
+    if [[ -n "$gpu_summary" ]]; then
+        printf '%s\n' "$gpu_summary" |
+            awk -F', ' '{ printf "  gpu%s %s: util=%s%% mem=%s/%s MiB power=%s W temp=%s C\n", $1, $2, $3, $4, $5, $6, $7 }'
+    fi
 fi
 
 shopt -s nullglob
@@ -189,9 +231,19 @@ for log in "${logs[@]}"; do
         [[ "$num_envs" =~ ^[0-9]+$ ]] || num_envs=0
     fi
 
-    episode_count="$(count_files "$data_dir" 'episode_*.npz')"
-    latest="$(single_last_match 'Queued episode [0-9]+|Collection complete|Traceback|Exception|Fatal|Error' "$log")"
-    recent="$(last_match 'Episode [0-9]+ step [0-9]+|Episode [0-9]+: reset|Queued episode [0-9]+|Collection complete|Traceback|Exception|Fatal|Error' "$log")"
+    legacy_episode_count="$(count_files "$data_dir" 'episode_*.npz')"
+    real_episode_count="$(count_real_schema_episodes "$data_dir")"
+    real_session_count="$(count_real_schema_sessions "$data_dir")"
+    if ((real_session_count > 0)); then
+        episode_count="$real_episode_count"
+        env_done="$real_session_count"
+    else
+        episode_count="$legacy_episode_count"
+        env_done=$((legacy_episode_count * num_envs))
+    fi
+    problem_pattern='Traceback|Exception|Fatal|(^|[^A-Za-z])ERROR([^A-Za-z]|$)|\[Error\]'
+    latest="$(single_last_match "Queued episode [0-9]+|Collection complete|${problem_pattern}" "$log")"
+    recent="$(last_match "Episode [0-9]+ step [0-9]+|Episode [0-9]+: reset|Queued episode [0-9]+|Collection complete|${problem_pattern}" "$log")"
 
     screen_status="unknown"
     if [[ "$run_name" =~ shard([0-9]+)_gpu([0-9]+) ]]; then
@@ -209,13 +261,15 @@ for log in "${logs[@]}"; do
 
     total_done=$((total_done + episode_count))
     total_target=$((total_target + progress_total))
-    total_env_done=$((total_env_done + episode_count * num_envs))
+    total_env_done=$((total_env_done + env_done))
     total_env_target=$((total_env_target + progress_total * num_envs))
 
     printf '\n  %s\n' "$run_name"
     printf '    screen: %s\n' "$screen_status"
     printf '    data: %s\n' "$data_dir"
-    printf '    episodes: %s/%s (%s), envs=%s\n' "$episode_count" "$progress_total" "$(percent "$episode_count" "$progress_total")" "$num_envs"
+    printf '    episodes: %s/%s (%s), envs=%s, env-sessions=%s/%s (%s)\n' \
+        "$episode_count" "$progress_total" "$(percent "$episode_count" "$progress_total")" "$num_envs" \
+        "$env_done" "$((progress_total * num_envs))" "$(percent "$env_done" "$((progress_total * num_envs))")"
     if [[ -n "$latest" ]]; then
         printf '    latest: %s\n' "$latest"
     fi

@@ -80,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--camera-warmup-render-steps",
         type=int,
-        default=1,
+        default=10,
         help="Rendered warmup frames after camera annotators are attached.",
     )
     parser.add_argument("--output-dir", type=Path, default=SCRIPT_DIR / "runs" / "collected_data")
@@ -111,10 +111,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--transparent-label", type=str, default="transparent_obj")
     parser.add_argument("--debug-masks", action="store_true", help="Print semantic mask debug information during image capture.")
-    parser.add_argument("--world-camera-width", type=int, default=640)
-    parser.add_argument("--world-camera-height", type=int, default=480)
-    parser.add_argument("--wrist-camera-width", type=int, default=320)
-    parser.add_argument("--wrist-camera-height", type=int, default=240)
+    parser.add_argument("--world-camera-width", type=int, default=STANDARD_RS_WIDTH)
+    parser.add_argument("--world-camera-height", type=int, default=STANDARD_RS_HEIGHT)
+    parser.add_argument("--wrist-camera-width", type=int, default=STANDARD_RS_WIDTH)
+    parser.add_argument("--wrist-camera-height", type=int, default=STANDARD_RS_HEIGHT)
     parser.add_argument(
         "--save-legacy-arrays",
         action="store_true",
