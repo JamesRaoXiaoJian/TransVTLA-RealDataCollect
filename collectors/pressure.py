@@ -9,16 +9,17 @@ from pathlib import Path
 from typing import Optional
 
 from timestamp_utils import get_timestamp_us
-from channel_config import VALID_CHANNELS
+from channel_config import PRESSURE_VALUE_COLUMNS, VALID_CHANNELS
 
 TACTILE_FPS = 200
 
 DEFAULT_PRESSURE_LOCAL_PORT = 4321
 DEFAULT_PRESSURE_REMOTE_IP = "192.168.31.164"
 DEFAULT_PRESSURE_REMOTE_PORT = 2222
-PRESSURE_PACKET_FORMAT = "<Q64h"
-PRESSURE_PACKET_SIZE = struct.calcsize(PRESSURE_PACKET_FORMAT)
-PRESSURE_BUFFER_SIZE = PRESSURE_PACKET_SIZE
+RAW_PRESSURE_CHANNEL_COUNT = 64
+RAW_PRESSURE_PACKET_FORMAT = f"<Q{RAW_PRESSURE_CHANNEL_COUNT}h"
+RAW_PRESSURE_PACKET_SIZE = struct.calcsize(RAW_PRESSURE_PACKET_FORMAT)
+PRESSURE_BUFFER_SIZE = RAW_PRESSURE_PACKET_SIZE
 PRESSURE_BATCH_SIZE = 100
 PRESSURE_FLUSH_INTERVAL_S = 0.1
 
@@ -50,7 +51,7 @@ class PressureCollector:
         self.row_buffer: list[list[int]] = []
 
         self.latest_timestamp_us: Optional[int] = None
-        self.latest_values: list[int] = [0] * 64
+        self.latest_values: list[int] = [0] * len(VALID_CHANNELS)
 
         self.last_flush_time = time.time()
 
@@ -92,8 +93,8 @@ class PressureCollector:
             self.csv_file = open(csv_path, "w", newline="", encoding="utf-8")
             self.csv_writer = csv.writer(self.csv_file)
             # 双时间戳：sensor_timestamp_us（传感器时钟）+ host_monotonic_us（主机单调时钟）。
-            # 落盘只保存建模使用的有效触觉通道，完整 64 通道仍保留在 latest_values 供实时显示。
-            headers = ["sensor_timestamp_us", "host_monotonic_us"] + [f"CH{i}" for i in VALID_CHANNELS]
+            # 标准数据只保存建模使用的 20 个有效触觉通道。
+            headers = ["sensor_timestamp_us", "host_monotonic_us"] + PRESSURE_VALUE_COLUMNS
             self.csv_writer.writerow(headers)
             self.row_buffer = []
             self.last_flush_time = time.time()
@@ -131,22 +132,21 @@ class PressureCollector:
             except OSError:
                 break
 
-            if len(data) < PRESSURE_PACKET_SIZE:
+            if len(data) < RAW_PRESSURE_PACKET_SIZE:
                 print(f"[Pressure {addr}] Packet too small: {len(data)} bytes")
                 continue
 
-            sensor_timestamp_us, *values = struct.unpack(PRESSURE_PACKET_FORMAT, data)
+            sensor_timestamp_us, *raw_values = struct.unpack(RAW_PRESSURE_PACKET_FORMAT, data)
 
             # 记录主机单调时间戳（用于时钟域对齐）
             host_monotonic_us = get_timestamp_us()
+            selected_values = [raw_values[ch - 1] for ch in VALID_CHANNELS]
 
             with self.lock:
                 self.latest_timestamp_us = sensor_timestamp_us
-                self.latest_values = list(values)
+                self.latest_values = selected_values
 
                 if self.recording and self.csv_writer is not None:
-                    # 双时间戳：传感器时钟 + 主机单调时钟
-                    selected_values = [self.latest_values[ch - 1] for ch in VALID_CHANNELS]
                     row = [sensor_timestamp_us, host_monotonic_us] + selected_values
                     self.row_buffer.append(row)
                     self._flush_locked(force=False)

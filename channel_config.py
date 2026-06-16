@@ -6,8 +6,10 @@
     from channel_config import (
         LEFT_CHANNEL, RIGHT_CHANNEL,
         LEFT_MATRIX_CHANNELS, RIGHT_MATRIX_CHANNELS,
-        VALID_CHANNELS, VALID_COL_INDICES,
+        VALID_CHANNELS, VALID_CHANNEL_INDEX,
+        PRESSURE_VALUE_COLUMNS, STANDARD_PRESSURE_COLUMNS,
         INTERPOLATE_CHANNELS,
+        channel_value, interpolate_pressure_values,
     )
 """
 
@@ -66,12 +68,45 @@ def load_channel_mapping(
     INTERPOLATE_CHANNELS,
 ) = load_channel_mapping()
 
-# 展平为一维列表（20 个有效通道）
+# 展平为一维列表（20 个有效通道，CSV 与模型均使用此顺序）
 VALID_CHANNELS: List[int] = (
     [LEFT_CHANNEL, RIGHT_CHANNEL]
     + [ch for row in LEFT_MATRIX_CHANNELS for ch in row]
     + [ch for row in RIGHT_MATRIX_CHANNELS for ch in row]
 )
 
-# CSV 列索引（CSV 第一列是 timestamp，通道数据从第 2 列开始，所以索引 = 通道号）
+# 标准压力 CSV：两个时间戳列 + 20 个有效通道列。
+PRESSURE_TIMESTAMP_COLUMNS: List[str] = ["sensor_timestamp_us", "host_monotonic_us"]
+PRESSURE_VALUE_COLUMNS: List[str] = [f"CH{ch}" for ch in VALID_CHANNELS]
+STANDARD_PRESSURE_COLUMNS: List[str] = PRESSURE_TIMESTAMP_COLUMNS + PRESSURE_VALUE_COLUMNS
+
+# 20 通道数组中的索引映射。
+VALID_CHANNEL_INDEX: Dict[int, int] = {ch: idx for idx, ch in enumerate(VALID_CHANNELS)}
+
+# 兼容旧代码命名：在标准 20 通道数组中，索引不再等于物理通道号。
 VALID_COL_INDICES: List[int] = list(VALID_CHANNELS)
+
+
+def channel_value(values: List[int], channel: int, default: int = 0) -> int:
+    """按物理通道号读取标准 20 通道数组中的值。"""
+    idx = VALID_CHANNEL_INDEX.get(channel)
+    if idx is None or idx >= len(values):
+        return default
+    return values[idx]
+
+
+def interpolate_pressure_values(values: List[int]) -> List[int]:
+    """对标准 20 通道数组应用配置的异常通道插值。"""
+    out = list(values)
+    for bad_ch, adjacent_chs in INTERPOLATE_CHANNELS.items():
+        bad_idx = VALID_CHANNEL_INDEX.get(bad_ch)
+        if bad_idx is None or bad_idx >= len(out):
+            continue
+        adjacent_values = [
+            out[idx]
+            for ch in adjacent_chs
+            if (idx := VALID_CHANNEL_INDEX.get(ch)) is not None and idx < len(out)
+        ]
+        if adjacent_values:
+            out[bad_idx] = int(sum(adjacent_values) / len(adjacent_values))
+    return out

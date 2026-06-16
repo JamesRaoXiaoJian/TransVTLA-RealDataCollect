@@ -17,37 +17,37 @@ import "./style.css";
 const pipeline = [
   { label: "采集", detail: "外部/腕部 RGB-D + 触觉 + 机械臂 + 夹爪", icon: Camera },
   { label: "审计", detail: "模态完整性 / 频率 / 时间戳 / 同步偏移", icon: Radar },
-  { label: "清洗", detail: "20 通道归一 / CH58 插值 / 去重 / 对齐重建", icon: SlidersHorizontal },
+  { label: "清洗", detail: "schema 校验 / 时间戳排序 / 去重 / 对齐重建", icon: SlidersHorizontal },
   { label: "划分", detail: "硬件视角划分 + 任务视图 + 软链接清单", icon: GitBranch },
   { label: "导出", detail: "RGB / RGB-D / 对齐训练集 / 可转 RLDS", icon: Database },
 ];
 
 const overviewKpis = [
   { value: "1,000", label: "真机轨迹" },
-  { value: "10,000", label: "仿真轨迹" },
   { value: "4", label: "任务视图" },
-  { value: "1:10", label: "真机/仿真比例" },
+  { value: "20", label: "触觉通道" },
+  { value: "RGB-D", label: "双视角" },
 ];
 
 const taskAllocation = [
-  { name: "T1 简单放入盒子", real: 400, sim: 4000, color: "#2f80ed" },
-  { name: "T2 复杂盒子/烧杯场景", real: 220, sim: 2200, color: "#10a37f" },
-  { name: "T3 烧杯放置三脚架", real: 180, sim: 1800, color: "#9c36b5" },
-  { name: "T4 试管插入试管架", real: 200, sim: 2000, color: "#e67700" },
+  { name: "T1 简单放入盒子", real: 400, color: "#2f80ed" },
+  { name: "T2 复杂盒子/烧杯场景", real: 220, color: "#10a37f" },
+  { name: "T3 烧杯放置三脚架", real: 180, color: "#9c36b5" },
+  { name: "T4 试管插入试管架", real: 200, color: "#e67700" },
 ];
 
 const modalityRows = [
   ["真机采集", "1,000", "RGB-D / 触觉 / 机械臂 / 夹爪", "按任务均衡"],
-  ["仿真采集", "10,000", "同一数据结构 + 同一任务标签", "与真机域对齐"],
   ["视觉同步", "外部 + 腕部", "RGB-D 深度对齐", "可直接回放"],
   ["状态同步", "触觉 + 机械臂", "时间戳对齐", "可用于训练"],
+  ["数据导出", "RLDS/TFDS", "统一字段 + episode 粒度", "可复现实验"],
 ];
 
 const cleanActions = [
   ["真机配额", "4 个任务共 1,000 条轨迹"],
-  ["仿真配额", "10,000 条轨迹，是真机的 10 倍"],
-  ["数据结构", "相机 / 触觉 / 机械臂状态保持一致"],
-  ["对齐方式", "共享时间戳逻辑和任务标签"],
+  ["预训练补充", "单任务仿真 10,000 条"],
+  ["质量审计", "完整性 / 频率 / 同步偏移"],
+  ["数据结构", "相机 / 触觉 / 机械臂 / 夹爪保持一致"],
 ];
 
 const tasks = [
@@ -56,8 +56,6 @@ const tasks = [
     title: "简单放入盒子",
     cn: "目标物体放入木盒",
     sessions: 400,
-    sim: 4000,
-    frames: "真机 400 / 仿真 4,000",
     sample: "session_20260615_203217",
     split: "dual_realsense_repositioned",
     frame: "0194",
@@ -70,8 +68,6 @@ const tasks = [
     title: "复杂盒子/烧杯",
     cn: "盒子与烧杯三脚架混合场景",
     sessions: 220,
-    sim: 2200,
-    frames: "真机 220 / 仿真 2,200",
     sample: "session_20260616_143430",
     split: "dual_realsense_repositioned",
     frame: "0149",
@@ -84,8 +80,6 @@ const tasks = [
     title: "烧杯放置三脚架",
     cn: "简单烧杯与三脚架场景",
     sessions: 180,
-    sim: 1800,
-    frames: "真机 180 / 仿真 1,800",
     sample: "session_20260615_210748",
     split: "dual_realsense_repositioned",
     frame: "0221",
@@ -98,8 +92,6 @@ const tasks = [
     title: "试管插入试管架",
     cn: "多孔试管架插入任务",
     sessions: 200,
-    sim: 2000,
-    frames: "真机 200 / 仿真 2,000",
     sample: "session_20260615_214044",
     split: "dual_realsense_repositioned",
     frame: "0251",
@@ -147,7 +139,7 @@ function App() {
 function StrategySlide() {
   return (
     <section className="slide strategy-slide">
-      <SlideHeader eyebrow="TransVTLA 数据工程" title="数据工程策略与当前概览" meta="真机 1,000 / 仿真 10,000" />
+      <SlideHeader eyebrow="TransVTLA 数据工程" title="数据工程策略与当前概览" meta="真机 1,000 条" />
       <div className="two-column">
         <div className="left-column">
           <div className="section-title">
@@ -196,12 +188,12 @@ function StrategySlide() {
               <div className="split-row" key={item.name}>
                 <div className="split-label">
                   <span>{item.name}</span>
-                  <strong>{item.real} 真机 + {item.sim} 仿真</strong>
+                  <strong>{item.real} 条真机轨迹</strong>
                 </div>
                 <div className="bar-track">
                   <div className="bar-fill" style={{ width: `${(item.real / 1000) * 100}%`, background: item.color }} />
                 </div>
-                <span className="frame-count">共 {item.real + item.sim} 条</span>
+                <span className="frame-count">占比 {Math.round((item.real / 1000) * 100)}%</span>
               </div>
             ))}
           </div>
@@ -231,7 +223,7 @@ function StrategySlide() {
 function TaskViewSlide() {
   return (
     <section className="slide task-slide">
-      <SlideHeader eyebrow="任务视图" title="四任务采集/回放视图矩阵" meta="真机 1,000 / 仿真 10,000" />
+      <SlideHeader eyebrow="任务视图" title="四任务采集/回放视图矩阵" meta="真机采集视图" />
       <div className="task-grid">
         {tasks.map((task) => <TaskConsole task={task} key={task.code} />)}
       </div>
@@ -251,7 +243,6 @@ function TaskConsole({ task }) {
         <div className="task-counts">
           <strong>{task.sessions}</strong>
           <span>真机</span>
-          <em>{task.sim} 仿真</em>
         </div>
       </div>
       <div className="viewer-strip">
@@ -260,7 +251,7 @@ function TaskConsole({ task }) {
       </div>
       <div className="playback-row">
         <span>{task.sample}</span>
-        <strong>帧 {task.frame} | 仿真对齐</strong>
+        <strong>帧 {task.frame} | 采集回放</strong>
       </div>
       <div className="telemetry">
         <Metric icon={Camera} label="对齐帧" value={task.rows.aligned} />

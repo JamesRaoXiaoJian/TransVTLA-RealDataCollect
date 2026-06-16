@@ -1,10 +1,11 @@
-"""herong_9_pressure_data.py
+"""Debug-only 64-channel pressure UDP viewer.
 
-Listen for the pressure UDP packets and refresh-display the 64 channels
-in-place in the terminal (no accumulating new lines).
+This script is intentionally outside the standard data pipeline. It listens for
+the raw hardware UDP packets and refresh-displays all 64 raw channels in-place
+in the terminal for sensor debugging.
 
 Usage:
-    python herong_9_pressure_data.py
+    python debug_collect_64ch_pressure.py
 
 The script expects the packet format <Q64h> (uint64 timestamp_us + 64 int16).
 It does a single HELLO handshake to the remote device and then prints a

@@ -26,10 +26,14 @@ from session_schema import (
     rgb_path,
 )
 
-# Pressure channel mapping (from Channel Mapping.txt)
+# Pressure channel mapping (from channel_mapping.json)
 from channel_config import (
     LEFT_CHANNEL, RIGHT_CHANNEL,
     LEFT_MATRIX_CHANNELS, RIGHT_MATRIX_CHANNELS,
+    PRESSURE_VALUE_COLUMNS,
+    VALID_CHANNELS,
+    channel_value,
+    interpolate_pressure_values,
 )
 
 ANNOTATION_FILE = "annotations.json"
@@ -108,11 +112,15 @@ def load_pressure_csv(pressure_dir: Path) -> list[list[int]]:
     rows: list[list[int]] = []
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
-        next(reader, None)
+        header = next(reader, None) or []
+        channel_cols = [c for c in header if c.startswith("CH")]
+        if channel_cols != PRESSURE_VALUE_COLUMNS:
+            return []
+        channel_indices = [header.index(c) for c in PRESSURE_VALUE_COLUMNS]
         for row in reader:
             try:
-                vals = [int(x) for x in row[1:65]]
-                if len(vals) == 64:
+                vals = [int(row[i]) for i in channel_indices]
+                if len(vals) == len(VALID_CHANNELS):
                     rows.append(vals)
             except (ValueError, IndexError):
                 pass
@@ -173,13 +181,13 @@ class PressureDashboard(QtWidgets.QWidget):
 
     def __init__(self, parent: QtWidgets.QWidget | None = None):
         super().__init__(parent)
-        self._values: list[int] = [0] * 64
+        self._values: list[int] = [0] * len(VALID_CHANNELS)
         self._state_text = ""
         self.setMinimumHeight(320)
 
     def set_values(self, values: list[int]) -> None:
-        if len(values) >= 64:
-            self._values = list(values)
+        if len(values) == len(VALID_CHANNELS):
+            self._values = interpolate_pressure_values(values)
             self.update()
 
     def set_state_info(self, text: str) -> None:
@@ -188,7 +196,7 @@ class PressureDashboard(QtWidgets.QWidget):
 
     @staticmethod
     def _get_val(values: list[int], ch: int) -> int:
-        return values[ch - 1] if 0 <= ch - 1 < len(values) else 0
+        return channel_value(values, ch)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         p = QtGui.QPainter(self)

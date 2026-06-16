@@ -5,7 +5,7 @@ This script performs the repair pass requested after the sessions.zip merge:
 
 * Sort pressure rows by their usable timestamp column.
 * Replace bad pressure channel CH58 with the mean of CH61, CH57, and CH59.
-* Trim legacy 64-channel pressure CSVs to the configured 20 tactile channels.
+* Validate pressure CSVs against the configured 20 tactile channels.
 * Deduplicate gripper rows by timestamp and fill missing sys_state values.
 * Rebuild dual-RealSense aligned_timesteps.csv files from cleaned CSV sources.
 * Write a clean split manifest for downstream dataset construction.
@@ -32,7 +32,7 @@ from typing import Any, Iterable
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from channel_config import INTERPOLATE_CHANNELS, VALID_CHANNELS  # noqa: E402
+from channel_config import INTERPOLATE_CHANNELS, PRESSURE_VALUE_COLUMNS  # noqa: E402
 
 
 DEFAULT_ROOTS = [
@@ -78,7 +78,6 @@ class CleaningSummary:
     pressure_ch58_rows_replaced: int = 0
     pressure_ch58_rows_changed: int = 0
     pressure_ch58_rows_failed: int = 0
-    pressure_64ch_files_trimmed: int = 0
     gripper_files_seen: int = 0
     gripper_files_changed: int = 0
     gripper_duplicate_rows_removed: int = 0
@@ -343,10 +342,15 @@ def clean_pressure_file(path: Path, apply: bool) -> FileChange:
             replaced_rows += 1
 
     non_channel_cols = [c for c in header if not _is_channel_col(c)]
-    valid_channel_cols = [f"CH{ch}" for ch in VALID_CHANNELS]
-    output_header = non_channel_cols + [c for c in valid_channel_cols if c in header]
-    missing_valid_cols = [c for c in valid_channel_cols if c not in header]
-    trimmed = original_channel_count > len([c for c in output_header if _is_channel_col(c)])
+    channel_cols = [c for c in header if _is_channel_col(c)]
+    missing_valid_cols = [c for c in PRESSURE_VALUE_COLUMNS if c not in header]
+    extra_channel_cols = [c for c in channel_cols if c not in PRESSURE_VALUE_COLUMNS]
+    if missing_valid_cols or extra_channel_cols:
+        raise ValueError(
+            "pressure.csv must use the standard 20-channel schema; "
+            f"missing={missing_valid_cols}, extra={extra_channel_cols}"
+        )
+    output_header = non_channel_cols + PRESSURE_VALUE_COLUMNS
 
     output_rows = [{name: row.get(name, "") for name in output_header} for row in rows]
     changed = original_header != output_header or original_rows != output_rows
@@ -364,11 +368,11 @@ def clean_pressure_file(path: Path, apply: bool) -> FileChange:
             "rows_reordered": rows_reordered,
             "original_channel_count": original_channel_count,
             "output_channel_count": len([c for c in output_header if _is_channel_col(c)]),
-            "trimmed_64_to_20": trimmed and original_channel_count == 64,
             "ch58_rows_replaced": replaced_rows,
             "ch58_rows_changed": changed_rows,
             "ch58_rows_failed": failed_rows,
             "missing_valid_channels": missing_valid_cols,
+            "extra_channel_columns": extra_channel_cols,
         },
     )
 
@@ -537,7 +541,15 @@ def rebuild_alignment(session: Path, apply: bool) -> FileChange:
 
     robot_value_cols = [c for c in robot_header if c != "timestamp_us"]
     gripper_value_cols = [c for c in gripper_header if c != "timestamp_us"]
-    pressure_value_cols = [f"CH{ch}" for ch in VALID_CHANNELS if f"CH{ch}" in pressure_header]
+    pressure_value_cols: list[str] = []
+    if pressure_header:
+        pressure_channel_cols = [c for c in pressure_header if _is_channel_col(c)]
+        if pressure_channel_cols != PRESSURE_VALUE_COLUMNS:
+            raise ValueError(
+                "pressure.csv must use the standard 20-channel schema before rebuilding alignment; "
+                f"found={pressure_channel_cols}"
+            )
+        pressure_value_cols = PRESSURE_VALUE_COLUMNS
 
     output_header = (
         ["frame_id", "visual_timestamp_us", "robot_timestamp_us", "robot_offset_ms"]
@@ -826,8 +838,6 @@ def run_cleaning(args: argparse.Namespace) -> CleaningSummary:
                 summary.pressure_ch58_rows_replaced += int(details.get("ch58_rows_replaced", 0))
                 summary.pressure_ch58_rows_changed += int(details.get("ch58_rows_changed", 0))
                 summary.pressure_ch58_rows_failed += int(details.get("ch58_rows_failed", 0))
-                if details.get("trimmed_64_to_20"):
-                    summary.pressure_64ch_files_trimmed += 1
             except Exception as exc:  # pragma: no cover - reported in summary.
                 summary.errors.append(f"{_rel(pressure_path)}: {exc}")
 
@@ -902,8 +912,7 @@ def print_summary(summary: CleaningSummary) -> None:
         f"ch58_changed_files={summary.pressure_ch58_files_changed}, "
         f"ch58_rows_replaced={summary.pressure_ch58_rows_replaced}, "
         f"ch58_rows_changed={summary.pressure_ch58_rows_changed}, "
-        f"ch58_rows_failed={summary.pressure_ch58_rows_failed}, "
-        f"trimmed_64ch={summary.pressure_64ch_files_trimmed}"
+        f"ch58_rows_failed={summary.pressure_ch58_rows_failed}"
     )
     print(
         "gripper: "

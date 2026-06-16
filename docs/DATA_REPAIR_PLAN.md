@@ -139,8 +139,8 @@ python preprocess_pressure.py \
 ```
 
 **处理流程**（每个 session）：
-1. 读取 `pressure/pressure.csv`（64 通道）
-2. 提取有效 20 通道（CH1,9-19,25-32）
+1. 读取标准 `pressure/pressure.csv`（20 个有效通道）
+2. 按 `channel_mapping.json` 校验通道顺序
 3. 动态基线去除（前 50 行均值）
 4. 归一化（÷3500，clip 到 [0,1]）
 5. 滑动窗口（size=16, stride=1）→ shape `(N, 16, 20)`

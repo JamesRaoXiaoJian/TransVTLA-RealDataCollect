@@ -3,7 +3,7 @@
 将原始 ADC 读数转化为 VLA 模型可直接使用的归一化张量数据。
 
 处理流程：
-    1. 读取所有 pressure.csv，提取 20 个有效通道
+    1. 读取所有标准 20 通道 pressure.csv
     2. 动态基线消除（取前 50 行均值作为基线）
     3. 全局 Min-Max 归一化到 [0, 1]
     4. 滑动窗口切片为 [Samples, window_size, 20] 张量
@@ -23,19 +23,19 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# 通道定义（从 Channel Mapping.txt 统一读取）
+# 通道定义（从 channel_mapping.json 统一读取）
 # 最终输出维度顺序：左总压(1) + 右总压(1) + 左矩阵(9) + 右矩阵(9) = 20
 # ============================================================
 from channel_config import (
     LEFT_CHANNEL, RIGHT_CHANNEL,
     LEFT_MATRIX_CHANNELS, RIGHT_MATRIX_CHANNELS,
-    VALID_CHANNELS, INTERPOLATE_CHANNELS,
+    VALID_CHANNELS, PRESSURE_VALUE_COLUMNS, INTERPOLATE_CHANNELS,
 )
 
 LEFT_TOTAL_CH = LEFT_CHANNEL
 RIGHT_TOTAL_CH = RIGHT_CHANNEL
 
-VALID_COL_NAMES: list[str] = [f"CH{ch}" for ch in VALID_CHANNELS]
+VALID_COL_NAMES: list[str] = PRESSURE_VALUE_COLUMNS
 
 # ============================================================
 # 处理参数
@@ -49,8 +49,8 @@ STRIDE = 1                   # 滑动窗口步长
 def load_pressure_csv(csv_path: Path) -> pd.DataFrame:
     """读取单个 pressure.csv 文件，返回标准 20 通道 DataFrame。
 
-    兼容旧格式（timestamp_us + CH1..CH64）和新格式
-    （sensor_timestamp_us + host_monotonic_us + 标准 20 通道）。
+    输入必须是当前标准格式：
+    sensor_timestamp_us + host_monotonic_us + 标准 20 个 CH* 通道。
     """
     df = pd.read_csv(csv_path)
     missing = [c for c in VALID_COL_NAMES if c not in df.columns]
@@ -76,9 +76,7 @@ def load_pressure_csv_with_timestamps(csv_path: Path) -> tuple[pd.DataFrame, dic
 
 
 def extract_valid_channels(df: pd.DataFrame) -> np.ndarray:
-    """从 64 通道 DataFrame 中提取 20 个有效通道，返回 (N, 20) 数组。
-
-    输入可以是完整 CH1..CH64，也可以已经是标准 20 通道。
+    """读取标准 20 通道 DataFrame，返回 (N, 20) 数组。
 
     对于 INTERPOLATE_CHANNELS 中标记的异常通道，使用相邻通道均值替代。
     """
@@ -325,21 +323,20 @@ def run_test() -> None:
 
     np.random.seed(42)
     n_rows = 500
-    n_channels = 64
+    n_channels = len(VALID_CHANNELS)
 
     # 1. 生成模拟 ADC 数据
     #    - 基线值在 4700~5007 之间（模拟未接触状态）
     #    - 在第 100~200 行模拟按压（ADC 值下降到 2000~3000）
     raw = np.random.randint(4700, 5007, size=(n_rows, n_channels)).astype(np.float64)
 
-    # 在有效通道上模拟按压
-    for ch in VALID_CHANNELS:
-        col_idx = ch - 1
+    # 在标准 20 通道上模拟按压
+    for col_idx, _ch in enumerate(VALID_CHANNELS):
         raw[100:200, col_idx] = np.random.randint(1500, 3000, size=100).astype(np.float64)
         raw[300:350, col_idx] = np.random.randint(2000, 3500, size=50).astype(np.float64)
 
     # 转为 DataFrame 模拟 CSV 格式
-    ch_cols = [f"CH{i}" for i in range(1, 65)]
+    ch_cols = PRESSURE_VALUE_COLUMNS
     df = pd.DataFrame(raw, columns=ch_cols)
 
     print(f"\n模拟数据: {n_rows} 行 x {n_channels} 通道")

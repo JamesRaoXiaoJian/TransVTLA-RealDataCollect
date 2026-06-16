@@ -17,17 +17,17 @@
 | 数据轨道 | 数量 | 覆盖内容 | 对齐目标 |
 | --- | ---: | --- | --- |
 | 真机数据 | 1,000 条轨迹 | 外部/腕部 RGB-D、触觉、机械臂、夹爪 | 真实采集与回放 |
-| 仿真数据 | 10,000 条轨迹 | 同任务标签、同传感器结构 | 尽量对齐真机 schema 与视角 |
 | 任务视图 | 4 类任务 | 放入盒子、复杂盒子/烧杯、烧杯三脚架、试管架 | 训练与评估划分 |
+| 仿真预训练 | 10,000 条轨迹 | 单任务仿真数据 | 作为预训练补充 |
 
-四个任务的展示配额：
+四个真机任务的展示配额：
 
-| 任务 | 真机轨迹 | 仿真轨迹 |
-| --- | ---: | ---: |
-| T1 简单放入盒子 | 400 | 4,000 |
-| T2 复杂盒子/烧杯 | 220 | 2,200 |
-| T3 烧杯放置三脚架 | 180 | 1,800 |
-| T4 试管插入试管架 | 200 | 2,000 |
+| 任务 | 真机轨迹 |
+| --- | ---: |
+| T1 简单放入盒子 | 400 |
+| T2 复杂盒子/烧杯 | 220 |
+| T3 烧杯放置三脚架 | 180 |
+| T4 试管插入试管架 | 200 |
 
 ## 快速入口
 
@@ -72,7 +72,7 @@ pip install pyrealsense2
 - 夹爪状态采集：读取 RM Plus 官方状态接口，记录位置、速度、电流、力和错误码。
 - 触觉/压力采集：标准化为 20 个有效触觉通道。
 - 离线回放：按帧查看外部 RGB-D、腕部 RGB-D、机械臂状态、夹爪状态和触觉数据。
-- 数据清洗：通道裁剪、CH58 插值、时间戳排序、夹爪去重、对齐表重建。
+- 数据清洗：schema 校验、异常通道按配置插值、时间戳排序、夹爪去重、对齐表重建。
 - 数据划分：按硬件视角和任务标签生成 manifest 与 symlink view。
 - 数据导出：支持 RGB-D RLDS/TFDS 转换入口。
 
@@ -81,7 +81,7 @@ pip install pyrealsense2
 | 路径 | 说明 |
 | --- | --- |
 | `collect_data.py` | 真机多模态采集主程序，包含 PySide6 采集界面 |
-| `data_viwer.py` | 离线 session 回放工具 |
+| `data_viewer.py` | 离线 session 回放工具 |
 | `test_frequency.py` | 采集前频率检查工具 |
 | `collectors/` | 相机、机械臂、夹爪、压力等采集器封装 |
 | `Robotic_Arm/` | 睿尔曼机械臂 Python SDK |
@@ -94,6 +94,7 @@ pip install pyrealsense2
 | `calibration/` | 相机外参、手眼标定和诊断脚本 |
 | `docs/` | 数据格式、采集优化和修复计划文档 |
 | `data-engineering-ppt/` | 两页数据工程网页 PPT 与高清导出图 |
+| `debug_collect_64ch_pressure.py` | 调试专用：查看压力下位机原始 64 通道 UDP 包，不进入标准数据流程 |
 
 ## 数据结构
 
@@ -129,9 +130,39 @@ sessions/
 - `camera_metadata.json`：双 RealSense 的 profile、内参、畸变、序列号和 depth scale。
 - `robot_state/robot_state.csv`：机械臂关节和末端位姿。
 - `robot_state/gripper_state.csv`：夹爪实时状态。
-- `pressure/pressure.csv`：标准 20 通道触觉数据。
+- `pressure/pressure.csv`：标准 20 通道触觉数据，列为 `sensor_timestamp_us`、`host_monotonic_us` 和 20 个有效 `CH*`。
 
 旧版 `dji/` + `realsense_rgb/` + `realsense_depth/` 会话仍可由回放、审计和转换脚本读取。
+
+## 数据工程流程
+
+### 1. 采集层
+
+`collect_data.py` 是真机采集主入口。采集期间各模态独立按自身频率写盘：双 RealSense 作为视觉主时钟，机械臂、夹爪和触觉按时间戳记录原始状态。录制结束后自动生成 `aligned_timesteps.csv`，把各模态对齐到视觉帧。
+
+### 2. 标准 Schema
+
+当前仓库主线只保留标准 20 通道触觉数据：
+
+| 字段组 | 说明 |
+| --- | --- |
+| `sensor_timestamp_us` | 压力下位机包内时间戳 |
+| `host_monotonic_us` | 采集主机单调时钟，用于跨模态同步 |
+| 20 个 `CH*` | `channel_mapping.json` 中定义的有效触觉通道 |
+
+20 通道顺序固定为：左总压、右总压、左 3x3 矩阵、右 3x3 矩阵。异常通道会按 `channel_mapping.json` 中的相邻通道配置插值替代。仓库不再把 64 通道压力 CSV 作为可兼容输入；只有 `debug_collect_64ch_pressure.py` 用于现场查看原始 64 通道 UDP 包。
+
+### 3. 审计与清洗
+
+`scripts/audit_dataset.py` 只读检查 session 完整性、频率、时间戳、同步偏移和压力 schema。`scripts/clean_dataset.py` 在备份后执行可复现修复：压力时间戳排序、异常触觉通道插值、夹爪重复时间戳去重、缺失状态填补，以及双 RealSense 对齐表重建。
+
+### 4. 任务划分
+
+任务层把真机 1,000 条轨迹拆成四类任务视图；另外保留单任务仿真 10,000 条作为预训练补充。任务划分结果通过 manifest 与 symlink view 管理，不复制大文件，便于回放、检查和训练复用。
+
+### 5. 训练导出
+
+`preprocess_pressure.py` 将标准 20 通道触觉序列转换为 `(Samples, 16, 20)` 滑窗张量；`Phase2_build_RLDSdata.py` 把 RGB-D、机械臂、夹爪和触觉数据转换为 RLDS/TFDS 训练入口。单任务仿真预训练数据应尽量对齐真机字段命名、视觉视角和 episode 粒度。
 
 ## 常用脚本
 
@@ -164,8 +195,8 @@ python collect_data.py \
 ### 离线回放
 
 ```bash
-python data_viwer.py --sessions sessions
-python data_viwer.py --sessions sessions --session session_20260429_120000
+python data_viewer.py --sessions sessions
+python data_viewer.py --sessions sessions --session session_20260429_120000
 ```
 
 回放操作：
@@ -184,8 +215,8 @@ python scripts/clean_dataset.py --apply
 
 清洗内容包括：
 
-- 历史 64 通道压力 CSV 裁剪为标准 20 通道。
-- CH58 使用相邻通道均值插值替代。
+- 压力 CSV 标准 20 通道 schema 校验。
+- 异常触觉通道按 `channel_mapping.json` 配置插值替代。
 - 非单调时间戳排序。
 - 夹爪重复时间戳去重。
 - dual-RealSense `aligned_timesteps.csv` 重建。

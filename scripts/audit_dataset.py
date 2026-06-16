@@ -24,6 +24,8 @@ from typing import Any, Iterable
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+from channel_config import PRESSURE_VALUE_COLUMNS  # noqa: E402
+
 
 DEFAULT_ROOTS = [
     Path("dataset/phase2_realdata_sessions/sessions"),
@@ -519,6 +521,9 @@ def audit_csv_modality(
     if modality == "pressure":
         channel_cols = [c for c in audit.extra.get("header", []) if c.startswith("CH")]
         audit.extra["pressure_channel_count"] = len(channel_cols)
+        audit.extra["pressure_channel_columns"] = channel_cols
+        audit.extra["missing_pressure_channels"] = [c for c in PRESSURE_VALUE_COLUMNS if c not in channel_cols]
+        audit.extra["extra_pressure_channels"] = [c for c in channel_cols if c not in PRESSURE_VALUE_COLUMNS]
         audit.extra["pressure_min_adc"] = min(channel_min.values()) if channel_min else None
         audit.extra["pressure_max_adc"] = max(channel_max.values()) if channel_max else None
         audit.extra["pressure_out_of_range_values"] = pressure_out_of_range
@@ -614,26 +619,17 @@ def _add_csv_issues(session: SessionAudit, audit: ModalityAudit, issues: list[Is
 
     if audit.modality == "pressure":
         channel_count = audit.extra.get("pressure_channel_count")
-        if channel_count not in (20, 64):
+        missing_channels = audit.extra.get("missing_pressure_channels") or []
+        extra_channels = audit.extra.get("extra_pressure_channels") or []
+        if channel_count != len(PRESSURE_VALUE_COLUMNS) or missing_channels or extra_channels:
             issues.append(
                 _make_issue(
                     session,
                     audit.modality,
                     "warn",
-                    "unexpected_pressure_channel_count",
-                    f"Pressure CSV has {channel_count} CH columns, expected 20 or 64.",
-                    "Inspect pressure schema before preprocessing.",
-                )
-            )
-        elif channel_count == 64:
-            issues.append(
-                _make_issue(
-                    session,
-                    audit.modality,
-                    "info",
-                    "legacy_pressure_64ch",
-                    "Pressure CSV uses legacy 64-channel layout.",
-                    "Use scripts/trim_pressure_channels.py --apply after verifying backups.",
+                    "nonstandard_pressure_schema",
+                    f"Pressure CSV has {channel_count} CH columns; expected exactly the standard 20-channel schema.",
+                    "Regenerate or fix pressure.csv before preprocessing.",
                 )
             )
 
@@ -1269,7 +1265,7 @@ def write_cleaning_plan(path: Path, summary: dict[str, Any], issues: list[Issue]
     buckets = [
         ("non_monotonic_timestamps", "Sort affected CSV files by the selected timestamp column after backup."),
         ("duplicate_timestamps", "Deduplicate equal timestamps after deciding whether to keep first, last, or averaged rows."),
-        ("legacy_pressure_64ch", "Trim legacy 64-channel pressure CSVs to the standard 20 modeling channels."),
+        ("nonstandard_pressure_schema", "Regenerate or fix pressure.csv so it contains exactly the standard 20 tactile channels."),
         ("pressure_adc_out_of_range", "Clip/filter invalid pressure ADC values during preprocessing, not in raw data."),
         ("missing_aligned_timesteps", "Build a sync index or aligned timestep file before per-frame training."),
         ("frames_csv_count_mismatch", "Use frames.csv as the canonical visual timeline or rebuild missing frame metadata."),
@@ -1293,7 +1289,6 @@ def write_cleaning_plan(path: Path, summary: dict[str, Any], issues: list[Issue]
     lines.append("## Existing Helper Commands")
     lines.append("```bash")
     lines.append("python scripts/verify_fixes.py")
-    lines.append("python scripts/trim_pressure_channels.py --data-root dataset/phase2_realdata_sessions/sessions --apply")
     lines.append("python scripts/build_sync_index.py --data-root dataset/phase2_realdata_sessions/sessions --dry-run")
     lines.append("python scripts/build_sync_index.py --data-root dataset/sessions --dry-run")
     lines.append("```")

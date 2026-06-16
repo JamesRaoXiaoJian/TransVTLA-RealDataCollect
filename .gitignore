@@ -30,6 +30,7 @@ processed_data.npz
 # Local editor and OS files
 .vscode/
 .idea/
+.claude/
 .DS_Store
 Thumbs.db
 
@@ -44,15 +45,11 @@ backup_*/
 dataset/
 isaacsim/scripts/runs/
 isaacsim/scripts/real_data/
+isaacsim/scripts/franka_viewer_snapshot.png
+isaacsim/scripts/gripper_force_data.csv
 
-# Common output files
+# Common local media/export outputs outside documented artifact folders
 *.csv
-*.json
-!channel_mapping.json
-*.png
-*.jpg
-*.jpeg
-*.bmp
 *.mp4
 *.avi
 *.mov

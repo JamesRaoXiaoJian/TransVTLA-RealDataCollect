@@ -79,11 +79,13 @@ VISUAL_FPS = 30
 VISUAL_INTERVAL_S = 1.0 / VISUAL_FPS
 FRAME_SAVE_QUEUE_SIZE = 180
 
-# Pressure channel mapping (from Channel Mapping.txt)
+# Pressure channel mapping (from channel_mapping.json)
 from channel_config import (
     LEFT_CHANNEL, RIGHT_CHANNEL,
     LEFT_MATRIX_CHANNELS, RIGHT_MATRIX_CHANNELS,
-    INTERPOLATE_CHANNELS,
+    VALID_CHANNELS,
+    channel_value,
+    interpolate_pressure_values,
 )
 
 
@@ -258,7 +260,7 @@ def create_session_paths(base: Path, prefix: str) -> SessionPaths:
 
 
 # ---------------------------------------------------------------------------
-# PySide6 helpers (reused from data_viwer.py pattern)
+# PySide6 helpers
 # ---------------------------------------------------------------------------
 
 
@@ -331,7 +333,7 @@ class PressureDashboard(QtWidgets.QWidget):
 
     def __init__(self, parent: QtWidgets.QWidget | None = None):
         super().__init__(parent)
-        self._values: list[int] = [0] * 64
+        self._values: list[int] = [0] * len(VALID_CHANNELS)
         self._state_text = ""
         self.setMinimumHeight(260)
         self.setAutoFillBackground(True)
@@ -340,14 +342,8 @@ class PressureDashboard(QtWidgets.QWidget):
         self.setPalette(pal)
 
     def set_values(self, values: list[int]) -> None:
-        if len(values) >= 64:
-            self._values = list(values)
-            # 对 INTERPOLATE_CHANNELS 中标记的异常通道，用相邻通道均值替代
-            for bad_ch, adjacent_chs in INTERPOLATE_CHANNELS.items():
-                if 0 <= bad_ch - 1 < len(self._values):
-                    adj_vals = [self._values[c - 1] for c in adjacent_chs if 0 <= c - 1 < len(self._values)]
-                    if adj_vals:
-                        self._values[bad_ch - 1] = int(sum(adj_vals) / len(adj_vals))
+        if len(values) == len(VALID_CHANNELS):
+            self._values = interpolate_pressure_values(values)
             self.update()
 
     def set_state_info(self, text: str) -> None:
@@ -356,7 +352,7 @@ class PressureDashboard(QtWidgets.QWidget):
 
     @staticmethod
     def _get_val(values: list[int], ch: int) -> int:
-        return values[ch - 1] if 0 <= ch - 1 < len(values) else 0
+        return channel_value(values, ch)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         p = QtGui.QPainter(self)
