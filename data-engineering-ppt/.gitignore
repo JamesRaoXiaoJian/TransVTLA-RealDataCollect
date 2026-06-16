@@ -1,0 +1,10 @@
+node_modules/
+dist/
+
+!package.json
+!package-lock.json
+!public/
+!public/assets/
+!public/assets/*.jpg
+!exports/
+!exports/*.png
