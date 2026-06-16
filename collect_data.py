@@ -516,6 +516,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session_paths: SessionPaths | None = None
         self.frame_id = 0
         self.save_worker: FrameSaveWorker | None = None
+        self._session_counts = self._count_sessions()
 
         self._build_ui()
         self._start_collectors()
@@ -589,6 +590,22 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.gripper is not None:
             self.gripper.stop()
         self.pressure.stop()
+
+    def _count_sessions(self) -> tuple[int, int]:
+        """统计 session 数量: (total, today)."""
+        output_dir = self.args.output
+        if not output_dir.exists():
+            return 0, 0
+        today_str = datetime.now().strftime("%Y%m%d")
+        total = 0
+        today = 0
+        prefix = self.args.session_prefix
+        for d in output_dir.iterdir():
+            if d.is_dir() and d.name.startswith(f"{prefix}_"):
+                total += 1
+                if today_str in d.name:
+                    today += 1
+        return total, today
 
     # ---- Recording toggle ----
 
@@ -928,8 +945,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 f" | SaveQ: {self.save_worker.queue.qsize()}"
                 f" | Drop: {self.save_worker.dropped_tasks}"
             )
+        # 更新 session 计数（每次录制停止后刷新）
+        if not self.recording:
+            self._session_counts = self._count_sessions()
+        total, today = self._session_counts
+        if self.recording:
+            total += 1
+            today += 1
         self.status_label.setText(
-            f"Status: {status} | Frames: {self.frame_id if self.recording else 0}{queue_text}"
+            f"Status: {status} | Frames: {self.frame_id if self.recording else 0} | "
+            f"Total: {total} | Today: {today}{queue_text}"
         )
 
         # Robot + gripper state → dashboard
