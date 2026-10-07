@@ -17,10 +17,11 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from pathlib import Path
+from typing import Any
 
 import numpy as np
-import pandas as pd
 
 # ============================================================
 # 通道定义（从 channel_mapping.json 统一读取）
@@ -41,49 +42,84 @@ VALID_COL_NAMES: list[str] = PRESSURE_VALUE_COLUMNS
 # 处理参数
 # ============================================================
 BASELINE_ROWS = 50           # 基线计算行数（前 0.25 秒 @ 200Hz）
-MAX_PRESSURE_DROP = 3500.0   # 全局最大压力差（ADC 单位）
+MAX_PRESSURE_DROP = 3200.0   # 基于 855 条真机数据 positive delta P99.5 校准
+ADC_MIN = 0.0
+ADC_MAX = 5007.0
 WINDOW_SIZE = 16             # 滑动窗口大小
 STRIDE = 1                   # 滑动窗口步长
+NORMALIZATION_METHOD = "baseline_delta_clip"
+CALIBRATION_BASIS = "global_positive_delta_p99_5_20260629"
 
 
-def load_pressure_csv(csv_path: Path) -> pd.DataFrame:
-    """读取单个 pressure.csv 文件，返回标准 20 通道 DataFrame。
+def _read_pressure_csv_arrays(csv_path: Path) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """读取单个 pressure.csv，返回 20 通道 ADC 数组和可用时间戳。
 
     输入必须是当前标准格式：
-    sensor_timestamp_us + host_monotonic_us + 标准 20 个 CH* 通道。
+    可选时间戳列 + 标准 20 个 CH* 通道。
     """
-    df = pd.read_csv(csv_path)
-    missing = [c for c in VALID_COL_NAMES if c not in df.columns]
-    if missing:
-        raise ValueError(f"CSV 缺少列: {missing}，文件: {csv_path}")
-    return df[VALID_COL_NAMES]
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        missing = [c for c in VALID_COL_NAMES if c not in fieldnames]
+        if missing:
+            raise ValueError(f"CSV 缺少列: {missing}，文件: {csv_path}")
+
+        timestamp_cols = [
+            col for col in ("sensor_timestamp_us", "host_monotonic_us", "timestamp_us")
+            if col in fieldnames
+        ]
+        values: list[list[float]] = []
+        timestamps: dict[str, list[int]] = {col: [] for col in timestamp_cols}
+
+        for row in reader:
+            try:
+                values.append([float(row[col]) for col in VALID_COL_NAMES])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"CSV 压力值无法解析: {csv_path}") from exc
+
+            for col in timestamp_cols:
+                raw = row.get(col)
+                try:
+                    timestamps[col].append(int(float(raw)))  # tolerate integer-like floats
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"CSV 时间戳无法解析: {col}, 文件: {csv_path}") from exc
+
+    data = np.asarray(values, dtype=np.float64)
+    ts_arrays = {col: np.asarray(vals, dtype=np.int64) for col, vals in timestamps.items()}
+    if "sensor_timestamp_us" not in ts_arrays and "timestamp_us" in ts_arrays:
+        ts_arrays["sensor_timestamp_us"] = ts_arrays["timestamp_us"].copy()
+    return data, ts_arrays
 
 
-def load_pressure_csv_with_timestamps(csv_path: Path) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
+def load_pressure_csv(csv_path: Path) -> np.ndarray:
+    """读取单个 pressure.csv 文件，返回标准 20 通道数组。"""
+    data, _timestamps = _read_pressure_csv_arrays(csv_path)
+    return data
+
+
+def load_pressure_csv_with_timestamps(csv_path: Path) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """读取压力 CSV，返回标准 20 通道和可用时间戳数组。"""
-    raw = pd.read_csv(csv_path)
-    missing = [c for c in VALID_COL_NAMES if c not in raw.columns]
-    if missing:
-        raise ValueError(f"CSV 缺少列: {missing}，文件: {csv_path}")
-
-    timestamps: dict[str, np.ndarray] = {}
-    for col in ("sensor_timestamp_us", "host_monotonic_us", "timestamp_us"):
-        if col in raw.columns:
-            timestamps[col] = raw[col].to_numpy(dtype=np.int64, copy=True)
-    if "sensor_timestamp_us" not in timestamps and "timestamp_us" in timestamps:
-        timestamps["sensor_timestamp_us"] = timestamps["timestamp_us"].copy()
-    return raw[VALID_COL_NAMES], timestamps
+    return _read_pressure_csv_arrays(csv_path)
 
 
-def extract_valid_channels(df: pd.DataFrame) -> np.ndarray:
-    """读取标准 20 通道 DataFrame，返回 (N, 20) 数组。
+def extract_valid_channels(df: Any) -> np.ndarray:
+    """读取标准 20 通道数据，返回 (N, 20) 数组。
 
     对于 INTERPOLATE_CHANNELS 中标记的异常通道，使用相邻通道均值替代。
     """
-    missing = [c for c in VALID_COL_NAMES if c not in df.columns]
-    if missing:
-        raise ValueError(f"DataFrame 缺少有效通道列: {missing}")
-    data = df[VALID_COL_NAMES].values.astype(np.float64)
+    if isinstance(df, np.ndarray):
+        data = df.astype(np.float64, copy=True)
+        if data.ndim != 2 or data.shape[1] != len(VALID_COL_NAMES):
+            raise ValueError(f"压力数组形状错误: {data.shape}, 期望 (N, {len(VALID_COL_NAMES)})")
+    elif hasattr(df, "columns") and hasattr(df, "__getitem__"):
+        missing = [c for c in VALID_COL_NAMES if c not in df.columns]
+        if missing:
+            raise ValueError(f"DataFrame 缺少有效通道列: {missing}")
+        data = df[VALID_COL_NAMES].values.astype(np.float64)
+    else:
+        data = np.asarray(df, dtype=np.float64)
+        if data.ndim != 2 or data.shape[1] != len(VALID_COL_NAMES):
+            raise ValueError(f"压力数据形状错误: {data.shape}, 期望 (N, {len(VALID_COL_NAMES)})")
 
     # 处理需要插值的异常通道
     if INTERPOLATE_CHANNELS:
@@ -91,16 +127,33 @@ def extract_valid_channels(df: pd.DataFrame) -> np.ndarray:
             if bad_ch not in VALID_CHANNELS:
                 continue
             bad_idx = VALID_CHANNELS.index(bad_ch)
-            # 找到相邻通道在 VALID_CHANNELS 中的索引
-            adj_indices = []
-            for adj_ch in adjacent_chs:
-                if adj_ch in VALID_CHANNELS:
-                    adj_indices.append(VALID_CHANNELS.index(adj_ch))
+            adj_indices = [
+                VALID_CHANNELS.index(adj_ch)
+                for adj_ch in adjacent_chs
+                if adj_ch in VALID_CHANNELS
+            ]
             if adj_indices:
-                # 用相邻通道均值替代
                 data[:, bad_idx] = data[:, adj_indices].mean(axis=1)
 
     return data
+
+
+def pressure_valid_mask(data: np.ndarray) -> np.ndarray:
+    """返回合法 ADC 读数掩码。非法值不参与 baseline/delta。"""
+    return (data >= ADC_MIN) & (data <= ADC_MAX)
+
+
+def load_pressure_csv_dataframe(csv_path: Path) -> Any:
+    """兼容旧调用：按需使用 pandas 返回 DataFrame。"""
+    try:
+        import pandas as pd  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("pandas 不可用；请使用 load_pressure_csv 返回 numpy 数组") from exc
+    df = pd.read_csv(csv_path)
+    missing = [c for c in VALID_COL_NAMES if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV 缺少列: {missing}，文件: {csv_path}")
+    return df[VALID_COL_NAMES]
 
 
 def baseline_subtract(data: np.ndarray, baseline_rows: int = BASELINE_ROWS) -> np.ndarray:
@@ -121,11 +174,22 @@ def baseline_subtract(data: np.ndarray, baseline_rows: int = BASELINE_ROWS) -> n
         # 数据不足 baseline_rows 行时，用全部数据计算基线
         baseline_rows = n
 
-    # B_0: (20,) 每个通道的基线均值
-    baseline = data[:baseline_rows].mean(axis=0)
+    valid = pressure_valid_mask(data)
+    baseline_data = data[:baseline_rows].copy()
+    baseline_valid = valid[:baseline_rows]
+    baseline_data[~baseline_valid] = np.nan
+
+    with np.errstate(all="ignore"):
+        baseline = np.nanmean(baseline_data, axis=0)
+    if np.any(np.isnan(baseline)):
+        fallback = np.nanmean(np.where(valid, data, np.nan), axis=0)
+        baseline = np.where(np.isnan(baseline), fallback, baseline)
+    baseline = np.where(np.isnan(baseline), ADC_MAX, baseline)
 
     # Delta_P = B_0 - P_raw（ADC 值越大代表压力越小，所以取反）
-    delta = baseline - data
+    cleaned = data.copy()
+    cleaned[~valid] = np.take(baseline, np.where(~valid)[1])
+    delta = baseline - cleaned
 
     # clip 负值为 0（消除底噪波动导致的微小负数）
     return np.maximum(0.0, delta)
@@ -188,7 +252,7 @@ def sliding_window_timestamps(
     return start_ts, end_ts, center_ts
 
 
-def process_single_csv(csv_path: Path) -> np.ndarray:
+def process_single_csv(csv_path: Path, max_pressure_drop: float = MAX_PRESSURE_DROP) -> np.ndarray:
     """处理单个 CSV 文件，返回滑动窗口切片后的张量。
 
     Pipeline: 读取 -> 提取通道 -> 基线消除 -> 归一化 -> 滑动窗口
@@ -196,17 +260,20 @@ def process_single_csv(csv_path: Path) -> np.ndarray:
     Returns:
         (Samples, WINDOW_SIZE, 20) 的 numpy 数组
     """
-    windows, _timestamps = process_single_csv_with_timestamps(csv_path)
+    windows, _timestamps = process_single_csv_with_timestamps(csv_path, max_pressure_drop=max_pressure_drop)
     return windows
 
 
-def process_single_csv_with_timestamps(csv_path: Path) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+def process_single_csv_with_timestamps(
+    csv_path: Path,
+    max_pressure_drop: float = MAX_PRESSURE_DROP,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """处理单个 CSV，并返回窗口张量与同步时间戳。"""
     df, timestamps = load_pressure_csv_with_timestamps(csv_path)
     data = extract_valid_channels(df)
     delta = baseline_subtract(data)
-    normed = normalize(delta)
-    windows = sliding_window(normed)
+    normed = normalize(delta, max_drop=max_pressure_drop)
+    windows = sliding_window(normed).astype(np.float32, copy=False)
 
     output_ts: dict[str, np.ndarray] = {}
     for key, values in timestamps.items():
@@ -217,14 +284,31 @@ def process_single_csv_with_timestamps(csv_path: Path) -> tuple[np.ndarray, dict
         output_ts["window_start_host_us"] = start_ts
         output_ts["window_end_host_us"] = end_ts
         output_ts["window_center_host_us"] = center_ts
+        output_ts["window_start_time_us"] = start_ts
+        output_ts["window_end_time_us"] = end_ts
+        output_ts["window_center_time_us"] = center_ts
+        output_ts["time_base"] = np.array("host_monotonic")
     sensor_ts = timestamps.get("sensor_timestamp_us")
     if sensor_ts is not None:
-        _start_ts, _end_ts, center_ts = sliding_window_timestamps(sensor_ts)
+        start_ts, end_ts, center_ts = sliding_window_timestamps(sensor_ts)
         output_ts["window_center_sensor_us"] = center_ts
+        if host_ts is None:
+            output_ts["window_start_time_us"] = start_ts
+            output_ts["window_end_time_us"] = end_ts
+            output_ts["window_center_time_us"] = center_ts
+            base = "legacy_timestamp" if "timestamp_us" in timestamps else "sensor_timestamp"
+            output_ts["time_base"] = np.array(base)
+    valid = pressure_valid_mask(data)
+    output_ts["invalid_adc_values"] = np.array(data.size - int(np.count_nonzero(valid)), dtype=np.int64)
+    output_ts["invalid_adc_rows"] = np.array(int(np.count_nonzero(~np.all(valid, axis=1))), dtype=np.int64)
     return windows, output_ts
 
 
-def process_all_sessions(data_root: Path, output_path: Path | None = None) -> None:
+def process_all_sessions(
+    data_root: Path,
+    output_path: Path | None = None,
+    max_pressure_drop: float = MAX_PRESSURE_DROP,
+) -> None:
     """遍历 data_root 下所有 pressure.csv，按 session 保存，并可选合并保存。
 
     同时将每个 session 的结果单独保存到 session 目录下的
@@ -236,7 +320,13 @@ def process_all_sessions(data_root: Path, output_path: Path | None = None) -> No
         data_root/**/preprocessed_pressure/session_name.npz
         output_path（可选）合并所有 session 后的 .npz
     """
-    csv_files = sorted(data_root.rglob("pressure/pressure.csv"))
+    direct_file = data_root / "pressure" / "pressure.csv"
+    if direct_file.is_file():
+        csv_files = [direct_file]
+    else:
+        csv_files = sorted(data_root.glob("*/pressure/pressure.csv"))
+        if not csv_files:
+            csv_files = sorted(data_root.rglob("pressure/pressure.csv"))
 
     if not csv_files:
         print(f"未找到 pressure.csv 文件，请检查目录: {data_root}")
@@ -252,7 +342,10 @@ def process_all_sessions(data_root: Path, output_path: Path | None = None) -> No
         session_dir = csv_path.parent.parent
         session_name = session_dir.name
         try:
-            windows, timestamps = process_single_csv_with_timestamps(csv_path)
+            windows, timestamps = process_single_csv_with_timestamps(
+                csv_path,
+                max_pressure_drop=max_pressure_drop,
+            )
         except Exception as e:
             print(f"  跳过 {session_name}: {e}")
             continue
@@ -278,8 +371,12 @@ def process_all_sessions(data_root: Path, output_path: Path | None = None) -> No
             channels=np.array(VALID_CHANNELS),
             window_size=WINDOW_SIZE,
             stride=STRIDE,
-            max_pressure_drop=MAX_PRESSURE_DROP,
+            max_pressure_drop=max_pressure_drop,
             baseline_rows=BASELINE_ROWS,
+            adc_min=ADC_MIN,
+            adc_max=ADC_MAX,
+            normalization_method=np.array(NORMALIZATION_METHOD),
+            calibration_basis=np.array(CALIBRATION_BASIS),
             **timestamps,
         )
         total_samples += windows.shape[0]
@@ -305,8 +402,12 @@ def process_all_sessions(data_root: Path, output_path: Path | None = None) -> No
         channels=np.array(VALID_CHANNELS),
         window_size=WINDOW_SIZE,
         stride=STRIDE,
-        max_pressure_drop=MAX_PRESSURE_DROP,
+        max_pressure_drop=max_pressure_drop,
         baseline_rows=BASELINE_ROWS,
+        adc_min=ADC_MIN,
+        adc_max=ADC_MAX,
+        normalization_method=np.array(NORMALIZATION_METHOD),
+        calibration_basis=np.array(CALIBRATION_BASIS),
         session_info=np.array(session_info, dtype=object),
     )
     print(f"已保存合并数据: {output_path} ({output_path.stat().st_size / 1024:.1f} KB)")
@@ -335,15 +436,11 @@ def run_test() -> None:
         raw[100:200, col_idx] = np.random.randint(1500, 3000, size=100).astype(np.float64)
         raw[300:350, col_idx] = np.random.randint(2000, 3500, size=50).astype(np.float64)
 
-    # 转为 DataFrame 模拟 CSV 格式
-    ch_cols = PRESSURE_VALUE_COLUMNS
-    df = pd.DataFrame(raw, columns=ch_cols)
-
     print(f"\n模拟数据: {n_rows} 行 x {n_channels} 通道")
     print(f"有效通道数: {len(VALID_CHANNELS)}")
 
     # 2. 提取有效通道
-    data = extract_valid_channels(df)
+    data = extract_valid_channels(raw)
     assert data.shape == (n_rows, 20), f"形状错误: {data.shape}"
     print(f"提取通道后: {data.shape}")
 
@@ -398,6 +495,8 @@ def main() -> None:
                         help="数据根目录（包含 pressure/pressure.csv 的父目录）")
     parser.add_argument("--output", type=Path, default=None,
                         help="可选：合并所有 session 后的输出 .npz 文件路径")
+    parser.add_argument("--max-pressure-drop", type=float, default=MAX_PRESSURE_DROP,
+                        help="压力归一化分母（ADC 单位），默认使用当前真机校准值 3200.0")
     parser.add_argument("--test", action="store_true",
                         help="运行内置测试验证处理逻辑")
     args = parser.parse_args()
@@ -405,7 +504,7 @@ def main() -> None:
     if args.test:
         run_test()
     else:
-        process_all_sessions(args.data_root, args.output)
+        process_all_sessions(args.data_root, args.output, max_pressure_drop=args.max_pressure_drop)
 
 
 if __name__ == "__main__":

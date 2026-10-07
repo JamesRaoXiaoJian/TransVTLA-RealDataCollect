@@ -68,22 +68,24 @@ CAMERA_CONFIGS = {
         ], dtype=torch.float32),
         t=torch.tensor([0.42140274, 0.04006448, 0.38033282], dtype=torch.float32)
     ),
-    # World RealSense 固定相机（eye-to-hand）。
-    # 注意：下面仍是旧 DJI world camera 占位参数，切换到双 RealSense 后必须用
-    # calibration/world_realsense_calibration.py 导出的 CameraParams 替换。
+    # World RealSense D435 固定第三视角深度相机（eye-to-hand）。
+    # 标定日期：2026-06-23。内参来自 D435 848x480 profile，畸变系数为全 0。
+    # 标定质量：mean rot=3.78 deg, max rot=6.46 deg,
+    # mean trans=36.5 mm, max trans=70.3 mm, reprojection=0.0526 px。
+    # T_ee_target 显示棋盘格相对末端约 98.5 deg / 220 mm 偏移。
     # R/t 约定：T_base_cam；R 为相机坐标轴在机器人基座坐标系中的方向，t 为相机位置。
     "world_camera": CameraParams(
         K=torch.tensor([
-            [553.635449, 0.0, 632.236057],
-            [0.0, 553.887213, 340.647155],
+            [602.716614, 0.0, 432.202942],
+            [0.0, 603.465698, 249.251740],
             [0.0, 0.0, 1.0]
         ], dtype=torch.float32),
         R=torch.tensor([
-            [-1.0, 0.0,  0.0],
-            [ 0.0, 0.0, -1.0],
-            [ 0.0, -1.0, 0.0]
+            [-0.96943095,  0.09244450, -0.22728317],
+            [ 0.20452160, -0.20729519, -0.95666066],
+            [-0.13555273, -0.97390077,  0.18205148]
         ], dtype=torch.float32),
-        t=torch.tensor([0.133, 0.58, 0.32], dtype=torch.float32)
+        t=torch.tensor([0.33983827, 0.83416543, 0.11930434], dtype=torch.float32)
     ),
 }
 

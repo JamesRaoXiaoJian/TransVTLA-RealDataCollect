@@ -4,7 +4,6 @@ import argparse
 import csv
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 import json
-import math
 import os
 import sys
 import threading
@@ -70,8 +69,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-spacing", type=float, default=3.5)
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--steps-per-episode", type=int, default=360)
+    parser.add_argument("--physics-hz", type=float, default=60.0)
+    parser.add_argument("--robot-hz", type=float, default=60.0)
+    parser.add_argument("--gripper-hz", type=float, default=60.0)
+    parser.add_argument("--pressure-hz", type=float, default=140.0)
     parser.add_argument("--settle-steps", type=int, default=8)
-    parser.add_argument("--save-image-interval", type=int, default=10)
+    parser.add_argument("--save-image-interval", type=int, default=2)
     parser.add_argument(
         "--render-every-step",
         action="store_true",
@@ -123,13 +126,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pressure-contact-value",
         type=int,
-        default=800,
-        help="Synthetic tactile ADC drop used when the gripper contacts the cube.",
+        default=3200,
+        help="Maximum synthetic tactile ADC drop, aligned to real-data pressure normalization.",
     )
     parser.add_argument(
         "--pressure-idle-value",
         type=int,
-        default=3500,
+        default=5000,
         help="Synthetic tactile idle ADC baseline written when there is no contact.",
     )
     parser.add_argument(
@@ -140,6 +143,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", type=str, choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--active-gpu", type=int, default=0, help="Renderer GPU index for Isaac Sim launch config.")
+    parser.add_argument(
+        "--physics-gpu",
+        type=int,
+        default=None,
+        help="CUDA/PhysX device index. Override with 0 when CUDA_VISIBLE_DEVICES exposes one physical GPU.",
+    )
     parser.add_argument(
         "--max-gpu-count",
         type=int,
@@ -169,6 +178,8 @@ def parse_args() -> argparse.Namespace:
 
 args = parse_args()
 
+from sim_collection_contract import physics_gpu_index
+
 
 def configure_python_output() -> None:
     for stream in (sys.stdout, sys.stderr):
@@ -187,7 +198,7 @@ def build_simulation_app_config() -> dict[str, Any]:
     return {
         "headless": args.headless,
         "active_gpu": args.active_gpu,
-        "physics_gpu": args.active_gpu,
+        "physics_gpu": physics_gpu_index(active_gpu=args.active_gpu, override=args.physics_gpu),
         "multi_gpu": args.multi_gpu,
         "max_gpu_count": args.max_gpu_count,
         "enable_crashreporter": args.enable_crashreporter,
@@ -203,6 +214,8 @@ simulation_app = SimulationApp(build_simulation_app_config())
 
 import cv2
 import numpy as np
+import torch
+import warp as wp
 from isaacsim.core.api import World
 from isaacsim.core.experimental.prims import RigidPrim
 from isaacsim.core.simulation_manager import SimulationManager
@@ -212,6 +225,17 @@ from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.robot.manipulators.examples.franka.franka_experimental import FrankaExperimental
 from isaacsim.sensors.camera import Camera
 from pxr import Gf, Usd, UsdGeom
+
+from sim_collection_contract import (
+    FixedRateSchedule,
+    contact_stage_for_phase,
+    pose6_in_base_frame,
+    pressure_values_for_stage,
+    simulation_device,
+    should_render_for_camera_stream,
+    unwrap_euler_xyz,
+)
+from sim_gripper_state import GripperState, gripper_state_from_dofs
 
 
 PHASE_NAMES = {
@@ -321,9 +345,12 @@ def align_camera_aperture(stage: Usd.Stage, prim_path: str, resolution: tuple[in
 
 
 def should_render_step(next_step: int) -> bool:
-    if not args.headless or args.render_every_step:
-        return True
-    return args.save_data and args.save_image_interval > 0 and next_step % args.save_image_interval == 0
+    del next_step
+    return should_render_for_camera_stream(
+        headless=args.headless,
+        render_every_step=args.render_every_step,
+        save_visual_data=args.save_data and args.save_image_interval > 0,
+    )
 
 
 def monotonic_us() -> int:
@@ -351,32 +378,6 @@ def depth_meters_to_uint16_mm(depth: np.ndarray | None, shape: tuple[int, int]) 
         return np.zeros((height, width), dtype=np.uint16)
     depth_mm = np.rint(np.clip(arr, 0.0, 65.535) / DEPTH_PNG_UNIT_M)
     return depth_mm.astype(np.uint16)
-
-
-def quat_wxyz_to_rotvec(quat: np.ndarray) -> np.ndarray:
-    q = np.asarray(quat, dtype=float).reshape(-1)
-    if q.size < 4:
-        return np.zeros(3, dtype=float)
-    q = q[:4]
-    norm = float(np.linalg.norm(q))
-    if norm <= 1e-12:
-        return np.zeros(3, dtype=float)
-    q = q / norm
-    if q[0] < 0:
-        q = -q
-    w = float(np.clip(q[0], -1.0, 1.0))
-    xyz = q[1:4]
-    sin_half = float(np.linalg.norm(xyz))
-    if sin_half <= 1e-12:
-        return np.zeros(3, dtype=float)
-    angle = 2.0 * math.atan2(sin_half, w)
-    return xyz / sin_half * angle
-
-
-def pose6_from_state(position: Any, orientation: Any) -> list[float]:
-    pos = as_array(position).reshape(-1)[:3]
-    rotvec = quat_wxyz_to_rotvec(as_array(orientation))
-    return [float(v) for v in np.concatenate([pos, rotvec])]
 
 
 def camera_intrinsics_from_usd(
@@ -428,15 +429,20 @@ class RealSchemaSessionWriter:
         scene_config: dict[str, np.ndarray],
         env: dict[str, Any],
         stage: Usd.Stage,
+        epoch_us: int,
     ):
         self.root = root / session_name
         self.env_id = env_id
         self.episode_id = episode_id
         self.frame_id = 0
         self._closed = False
-        self._last_robot_timestamp_us: int | None = None
-        self._last_gripper_timestamp_us: int | None = None
-        self._last_pressure_timestamp_us: int | None = None
+        self.epoch_us = int(epoch_us)
+        self.env_origin = np.asarray(env["origin"], dtype=float)
+        self.robot_schedule = FixedRateSchedule(args.robot_hz)
+        self.gripper_schedule = FixedRateSchedule(args.gripper_hz)
+        self.pressure_schedule = FixedRateSchedule(args.pressure_hz)
+        self.pressure_sample_index = self.env_id * 1009
+        self.last_euler_xyz: np.ndarray | None = None
 
         self.world_rgb_dir = self.root / "world_camera" / "rgb"
         self.world_depth_dir = self.root / "world_camera" / "depth"
@@ -489,6 +495,10 @@ class RealSchemaSessionWriter:
                 "gripper_dof_state",
                 "gripper_dof_err",
                 "deadline_late_ms",
+                "left_finger_m",
+                "right_finger_m",
+                "gripper_opening_m",
+                "gripper_opening_normalized",
             ]
         )
 
@@ -499,7 +509,10 @@ class RealSchemaSessionWriter:
         self._write_camera_metadata(env, stage)
         self._write_sim_metadata(scene_config, env)
 
-    def write_sample(
+    def timestamp_for_elapsed(self, elapsed_s: float) -> int:
+        return self.epoch_us + round(float(elapsed_s) * 1_000_000.0)
+
+    def write_visual_sample(
         self,
         *,
         timestamp_us: int,
@@ -507,11 +520,6 @@ class RealSchemaSessionWriter:
         world_depth_m: np.ndarray | None,
         wrist_rgb: np.ndarray | None,
         wrist_depth_m: np.ndarray | None,
-        joint_positions: np.ndarray,
-        ee_position: Any,
-        ee_orientation: Any,
-        gripper_pos: float,
-        contact: bool,
     ) -> None:
         if self._closed:
             raise RuntimeError(f"Cannot write to closed session: {self.root}")
@@ -545,35 +553,64 @@ class RealSchemaSessionWriter:
             ]
         )
 
+    def write_state_samples(
+        self,
+        *,
+        elapsed_s: float,
+        joint_positions: np.ndarray,
+        ee_position: Any,
+        ee_orientation: Any,
+        gripper_state: GripperState,
+        contact_stage: str,
+        stage_progress: float,
+    ) -> None:
+        if self._closed:
+            raise RuntimeError(f"Cannot write to closed session: {self.root}")
+
         joints = [float(v) for v in np.asarray(joint_positions, dtype=float).reshape(-1)[:7]]
         joints += [0.0] * max(0, 7 - len(joints))
-        pose6 = pose6_from_state(ee_position, ee_orientation)
-        for ts in self._sample_times(timestamp_us, "_last_robot_timestamp_us", 10_000):
-            self.robot_writer.writerow([ts] + joints[:7] + pose6)
+        pose6 = pose6_in_base_frame(ee_position, ee_orientation, self.env_origin)
+        if self.last_euler_xyz is not None:
+            pose6[3:6] = unwrap_euler_xyz(pose6[3:6], self.last_euler_xyz)
+        self.last_euler_xyz = pose6[3:6].copy()
+        pose6_values = pose6.tolist()
+        for ts in self.robot_schedule.due_timestamps(self.epoch_us, elapsed_s):
+            self.robot_writer.writerow([ts] + joints[:7] + pose6_values)
 
-        idle_pressure = int(args.pressure_idle_value)
-        pressure_value = max(0, idle_pressure - int(args.pressure_contact_value)) if contact else idle_pressure
-        pressure_values = [pressure_value for _ in VALID_CHANNELS]
-        for ts in self._sample_times(timestamp_us, "_last_pressure_timestamp_us", 5_000):
-            self.pressure_writer.writerow([ts, ts] + pressure_values)
-
-        for ts in self._sample_times(timestamp_us, "_last_gripper_timestamp_us", 10_000):
+        contact_active = contact_stage not in {"idle", "release"}
+        for ts in self.gripper_schedule.due_timestamps(self.epoch_us, elapsed_s):
             self.gripper_writer.writerow(
                 [
                     ts,
-                    100,
+                    round(float(args.gripper_hz), 3),
                     0,
                     0.0,
                     "sim",
-                    round(float(gripper_pos), 6),
+                    round(gripper_state.legacy_position, 6),
                     "",
                     "",
-                    int(args.pressure_contact_value) if contact else 0,
-                    int(contact),
+                    int(args.pressure_contact_value) if contact_active else 0,
+                    int(contact_active),
                     "",
                     0.0,
+                    round(gripper_state.left_finger_m, 8),
+                    round(gripper_state.right_finger_m, 8),
+                    round(gripper_state.opening_m, 8),
+                    round(gripper_state.opening_normalized, 8),
                 ]
             )
+
+        for ts in self.pressure_schedule.due_timestamps(self.epoch_us, elapsed_s):
+            pressure_values = pressure_values_for_stage(
+                contact_stage,
+                VALID_CHANNELS,
+                baseline_adc=args.pressure_idle_value,
+                max_drop_adc=args.pressure_contact_value,
+                progress=stage_progress,
+                sample_index=self.pressure_sample_index,
+            )
+            self.pressure_writer.writerow([ts, ts] + pressure_values)
+            self.pressure_sample_index += 1
 
     def close(self) -> None:
         if self._closed:
@@ -582,18 +619,6 @@ class RealSchemaSessionWriter:
             file_obj.flush()
             file_obj.close()
         self._closed = True
-
-    def _sample_times(self, timestamp_us: int, attr_name: str, interval_us: int) -> list[int]:
-        last = getattr(self, attr_name)
-        if last is None:
-            setattr(self, attr_name, timestamp_us)
-            return [timestamp_us]
-
-        samples = list(range(last + interval_us, timestamp_us + 1, interval_us))
-        if not samples:
-            samples = [timestamp_us]
-        setattr(self, attr_name, samples[-1])
-        return samples
 
     def _write_camera_metadata(self, env: dict[str, Any], stage: Usd.Stage) -> None:
         standard_profile = standard_realsense_profile()
@@ -662,6 +687,27 @@ class RealSchemaSessionWriter:
             "world_camera_path": env["world_camera_path"],
             "wrist_camera_path": env["wrist_camera_path"],
             "scene_config": {key: np.asarray(value).tolist() for key, value in scene_config.items()},
+            "stream_rates_hz": {
+                "physics": args.physics_hz,
+                "visual_nominal": args.physics_hz / args.save_image_interval,
+                "robot": args.robot_hz,
+                "gripper": args.gripper_hz,
+                "pressure": args.pressure_hz,
+            },
+            "pose_contract": {
+                "position_frame": "environment_robot_base_translation",
+                "position_unit": "meter",
+                "rotation_representation": "euler_xyz",
+                "rotation_unit": "radian",
+            },
+            "pressure_model": {
+                "type": "phase_spatial_profile_v1",
+                "idle_adc": args.pressure_idle_value,
+                "max_drop_adc": args.pressure_contact_value,
+                "phase_to_contact_stage": {
+                    str(phase_id): contact_stage_for_phase(phase_id) for phase_id in PHASE_NAMES
+                },
+            },
         }
         (self.root / "sim_metadata.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -674,6 +720,7 @@ class RealSchemaRunWriter:
 
     def start_episode(self, episode_id: int, envs: list[dict[str, Any]]) -> None:
         self.close_episode()
+        epoch_us = monotonic_us()
         for env in envs:
             env_id = int(env["env_id"])
             session_name = f"session_ep{episode_id:03d}_env{env_id}"
@@ -685,13 +732,26 @@ class RealSchemaRunWriter:
                 scene_config=env["scene_config"],
                 env=env,
                 stage=self.stage,
+                epoch_us=epoch_us,
             )
 
-    def write_sample(self, env_id: int, **kwargs: Any) -> None:
+    def write_visual_sample(self, env_id: int, **kwargs: Any) -> None:
         session = self.sessions.get(env_id)
         if session is None:
             raise RuntimeError(f"No real-schema session open for env {env_id}")
-        session.write_sample(**kwargs)
+        session.write_visual_sample(**kwargs)
+
+    def write_state_samples(self, env_id: int, **kwargs: Any) -> None:
+        session = self.sessions.get(env_id)
+        if session is None:
+            raise RuntimeError(f"No real-schema session open for env {env_id}")
+        session.write_state_samples(**kwargs)
+
+    def timestamp_for_elapsed(self, env_id: int, elapsed_s: float) -> int:
+        session = self.sessions.get(env_id)
+        if session is None:
+            raise RuntimeError(f"No real-schema session open for env {env_id}")
+        return session.timestamp_for_elapsed(elapsed_s)
 
     def close_episode(self) -> None:
         for session in self.sessions.values():
@@ -852,11 +912,6 @@ def extract_mask(frame: dict[str, Any], transparent_label: str, debug: bool = Fa
     if debug:
         print(f"  [DEBUG] No transparent_ids found in idToLabels - object likely occluded, returning None")
     return None
-
-
-def bbox_distance(min_a: np.ndarray, max_a: np.ndarray, min_b: np.ndarray, max_b: np.ndarray) -> float:
-    gap = np.maximum(np.maximum(min_a - max_b, min_b - max_a), 0.0)
-    return float(np.linalg.norm(gap))
 
 
 class FrankaMultiEnvCollector:
@@ -1098,25 +1153,6 @@ class FrankaMultiEnvCollector:
         allowed_half = np.asarray(controller.box_inner_half_size, dtype=float) - np.max(controller.cube_size[:2]) / 2.0
         return bool(np.all(np.abs(cube_xy - box_center[:2]) <= allowed_half))
 
-    def gripper_contacts_cube(self, env: dict[str, Any]) -> bool:
-        cube_min, cube_max = world_bbox(self.stage, env["cube_path"])
-        for finger_path in [env["left_finger_path"], env["right_finger_path"]]:
-            finger_min, finger_max = world_bbox(self.stage, finger_path)
-            if bbox_distance(finger_min, finger_max, cube_min, cube_max) <= 0.005:
-                return True
-        return False
-
-    def gripper_position_proxy(self, env: dict[str, Any]) -> float:
-        try:
-            left_min, left_max = world_bbox(self.stage, env["left_finger_path"])
-            right_min, right_max = world_bbox(self.stage, env["right_finger_path"])
-        except Exception:
-            return 0.0
-        left_center = (left_min + left_max) / 2.0
-        right_center = (right_min + right_max) / 2.0
-        opening_m = float(np.linalg.norm(left_center - right_center))
-        return float(np.clip(opening_m * 10_000.0, 0.0, 1000.0))
-
     def step(self, data_dir: Path) -> None:
         self.current_step += 1
         save_images = args.save_data and args.save_image_interval > 0 and self.current_step % args.save_image_interval == 0
@@ -1126,6 +1162,9 @@ class FrankaMultiEnvCollector:
             world_images = wrist_images = world_masks = wrist_masks = world_depths = wrist_depths = None
 
         for env_id, (env, controller) in enumerate(zip(self.envs, self.controllers)):
+            phase_id = min(controller._event, max(PHASE_NAMES))
+            phase_step = controller._step
+            phase_duration = controller.events_dt[phase_id]
             if not controller.is_done():
                 controller.forward(args.ik_method)
 
@@ -1138,26 +1177,36 @@ class FrankaMultiEnvCollector:
             scene_config = env["scene_config"]
             distance = float(np.linalg.norm(as_array(ee_position).reshape(-1)[:3] - scene_config["target_position"]))
             success = controller.is_done() and self.cube_is_inside_box(controller)
+            contact_stage = contact_stage_for_phase(phase_id)
+            stage_progress = float(np.clip((phase_step + 1) / phase_duration, 0.0, 1.0))
+            elapsed_s = self.current_step / float(args.physics_hz)
+            gripper_state = gripper_state_from_dofs(as_array(dof_positions))
+
+            if args.save_data and self.real_writer is not None:
+                self.real_writer.write_state_samples(
+                    env_id,
+                    elapsed_s=elapsed_s,
+                    joint_positions=as_array(dof_positions).reshape(-1),
+                    ee_position=ee_position,
+                    ee_orientation=ee_orientation,
+                    gripper_state=gripper_state,
+                    contact_stage=contact_stage,
+                    stage_progress=stage_progress,
+                )
 
             if args.save_data and save_images:
-                contact = self.gripper_contacts_cube(env) or 2 <= controller._event <= 6
                 if self.real_writer is not None:
-                    self.real_writer.write_sample(
+                    self.real_writer.write_visual_sample(
                         env_id,
-                        timestamp_us=monotonic_us(),
+                        timestamp_us=self.real_writer.timestamp_for_elapsed(env_id, elapsed_s),
                         world_rgb=world_images[env_id] if world_images else None,
                         world_depth_m=world_depths[env_id] if world_depths else None,
                         wrist_rgb=wrist_images[env_id] if wrist_images else None,
                         wrist_depth_m=wrist_depths[env_id] if wrist_depths else None,
-                        joint_positions=as_array(dof_positions).reshape(-1),
-                        ee_position=ee_position,
-                        ee_orientation=ee_orientation,
-                        gripper_pos=self.gripper_position_proxy(env),
-                        contact=contact,
                     )
 
                 if args.save_legacy_arrays:
-                    pressure = 1 if contact else 0
+                    pressure = int(contact_stage != "idle")
                     self.data_buffer["joint_positions"].append(as_array(dof_positions).reshape(-1))
                     self.data_buffer["joint_velocities"].append(as_array(joint_velocities).reshape(-1))
                     self.data_buffer["ee_positions"].append(as_array(ee_position).reshape(-1)[:3])
@@ -1260,6 +1309,11 @@ def main() -> int:
     env_usd = args.env_usd.resolve()
     if not env_usd.exists():
         raise FileNotFoundError(f"Environment USD not found: {env_usd}")
+    for name in ("physics_hz", "robot_hz", "gripper_hz", "pressure_hz", "visual_fps"):
+        if float(getattr(args, name)) <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive")
+    if args.save_image_interval <= 0:
+        raise ValueError("--save-image-interval must be positive")
     data_dir = prepare_data_dir()
     write_config(data_dir)
     print("=" * 72)
@@ -1269,10 +1323,18 @@ def main() -> int:
     print(f"  data_dir: {data_dir}")
     print("=" * 72)
 
-    if "cuda" in args.device:
+    physics_gpu = physics_gpu_index(active_gpu=args.active_gpu, override=args.physics_gpu)
+    physics_device = simulation_device(args.device, active_gpu=physics_gpu)
+    if "cuda" in physics_device:
+        torch.cuda.set_device(physics_gpu)
+        wp.set_device(physics_device)
         SimulationManager.set_backend("torch")
-    SimulationManager.set_physics_sim_device(args.device)
-    world = World(stage_units_in_meters=1.0)
+    SimulationManager.set_physics_sim_device(physics_device)
+    world = World(
+        physics_dt=1.0 / float(args.physics_hz),
+        rendering_dt=1.0 / float(args.visual_fps),
+        stage_units_in_meters=1.0,
+    )
     collector = FrankaMultiEnvCollector(world)
     collector.setup_environments(env_usd)
     for _ in range(5):

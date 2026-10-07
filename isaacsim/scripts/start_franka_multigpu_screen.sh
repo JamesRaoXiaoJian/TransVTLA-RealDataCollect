@@ -223,12 +223,14 @@ for gpu in "${GPU_IDS[@]}"; do
         fi
 
         cmd=(
+            env "CUDA_VISIBLE_DEVICES=$gpu"
             scripts/run_franka_collection_quiet.sh
             --headless
             --env-usd "$ENV_USD"
             --num-envs "$shard_envs"
             --episodes "$EPISODES"
             --active-gpu "$gpu"
+            --physics-gpu 0
             --max-gpu-count 1
             --output-dir "$OUTPUT_DIR"
             --world-camera-width "$CAMERA_WIDTH"

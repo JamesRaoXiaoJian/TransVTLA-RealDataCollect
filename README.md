@@ -52,18 +52,26 @@ npm run react
 
 ### Python 环境
 
-建议使用 Python 虚拟环境，并安装基础依赖：
+项目使用 Python 3.11、`pyproject.toml` 和 `uv.lock` 管理完整依赖。当前工作区位于
+`fuseblk` 数据盘，大量 Python 小文件直接写入项目目录会很慢；推荐把环境实体放在本机
+文件系统，并在项目中保留 `.venv` 链接：
 
 ```bash
-pip install opencv-python numpy keyboard
-pip install pyrealsense2
+uv venv ~/.venvs/TransVTLA-RealDataCollect --python 3.11
+UV_PROJECT_ENVIRONMENT=~/.venvs/TransVTLA-RealDataCollect uv sync --frozen
+ln -s ~/.venvs/TransVTLA-RealDataCollect .venv
+source .venv/bin/activate
 ```
 
 说明：
 
+- 安装后优先执行 `source .venv/bin/activate` 再运行 `python`；不要在该数据盘上直接建立
+  包含大量实体文件的虚拟环境。
 - `pyrealsense2` 需要匹配本机 RealSense 驱动和 Python 版本。
 - 机械臂相关脚本依赖仓库内置的 `Robotic_Arm/` SDK。
 - GUI 采集和回放脚本依赖 PySide6。
+- Isaac Sim 脚本仍需在 Isaac Sim 自带 Python 运行时内执行，其 `omni`/`isaacsim` 模块
+  不由本项目 `.venv` 提供。
 
 ## 核心能力
 
